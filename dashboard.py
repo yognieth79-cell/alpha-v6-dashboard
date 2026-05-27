@@ -17,7 +17,6 @@ warnings.filterwarnings("ignore")
 # ==========================================
 st.set_page_config(page_title="Alpha V6 Quant Dashboard", layout="wide")
 
-# Inicialización rigurosa de la Memoria de Estado de Sesión
 if "config" not in st.session_state:
     st.session_state["config"] = {
         "symbol": "BNBUSDT", 
@@ -37,13 +36,14 @@ if "historial_alertas" not in st.session_state:
     st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
 
 def registrar_error(tipo, detalle):
-    st.session_state["errores"].append({"tipo": tipo, "detalle": detalle, "timestamp": datetime.utcnow()})
+    # Formateo de timestamp para el Audit Log visual
+    st.session_state["errores"].append({"tipo": tipo, "detalle": detalle, "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
 
 def verificar_error(tipo):
     return any(e["tipo"] == tipo for e in st.session_state["errores"])
 
 # -----------------------------------------------------------
-# PROVISIONAMIENTO DE AUDIOS AUTOMÁTICO (ANTI-LATENCIA)
+# PROVISIONAMIENTO DE AUDIOS AUTOMÁTICO
 # -----------------------------------------------------------
 def inicializar_recursos_audio():
     audios_institucionales = {
@@ -110,11 +110,12 @@ with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
 ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE DATOS (CON BALANCEO UTC-5 ECUADOR)
+# 2. INGESTA DE DATOS (ROTACIÓN DE NODOS Y EVASIÓN CLOUD)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False) 
 def get_binance_data(symbol, interval, dias_visuales):
-    if verificar_error("API_BINANCE"): return pd.DataFrame()
+    if verificar_error("API_BINANCE"): 
+        return pd.DataFrame()
 
     buffer_dias = {"15m": 3, "1h": 10, "4h": 40, "1d": 250}.get(interval, 5)
     dias_totales = dias_visuales + buffer_dias
@@ -123,19 +124,41 @@ def get_binance_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
+    # Nodos oficiales de Binance para evadir bloqueos de DNS o Cloud IP
+    endpoints_binance = ["api.binance.com", "api1.binance.com", "api2.binance.com", "api3.binance.com", "api4.binance.com"]
     df_list = []
+    
     while current_start < end_time_ms:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={current_start}"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/6.0'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-            if not data: break
-            df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
-            df_list.append(df_temp)
-            current_start = int(df_temp['Close_time'].iloc[-1]) + 1
-        except Exception as e:
-            registrar_error("API_BINANCE", str(e))
+        exito_nodo = False
+        ultimo_error_msg = ""
+        
+        for endpoint in endpoints_binance:
+            url = f"https://{endpoint}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={current_start}"
+            try:
+                # Simulamos un navegador estándar para evadir bloqueos básicos de scraping
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                })
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                
+                if not data: 
+                    exito_nodo = True
+                    break
+                    
+                df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
+                df_list.append(df_temp)
+                current_start = int(df_temp['Close_time'].iloc[-1]) + 1
+                exito_nodo = True
+                break  # Si el nodo funciona, rompemos el loop de rotación y seguimos descargando
+                
+            except Exception as e:
+                ultimo_error_msg = f"{endpoint}: {str(e)}"
+                continue  # Si el nodo falla, intentamos con el siguiente
+                
+        if not exito_nodo:
+            registrar_error("API_BINANCE", f"Bloqueo total de nodos. Último error reportado -> {ultimo_error_msg}")
             break
             
     if not df_list: 
@@ -150,7 +173,7 @@ def get_binance_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO (PROCESAMIENTO DE SEÑALES)
+# 3. MOTOR CUANTITATIVO
 # ==========================================
 def calcular_estrategia(df, angulo_requerido, sl_mult):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
@@ -234,7 +257,7 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 4. RENDERIZADO VISUAL & GESTIÓN DE TOASTS
+# 4. RENDERIZADO VISUAL, TOASTS Y AUDITORÍA
 # ==========================================
 df_raw = get_binance_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
 
@@ -333,5 +356,22 @@ if not df_raw.empty:
         if nuevo_angulo != st.session_state["config"]["angulo"]:
             st.session_state["config"]["angulo"] = nuevo_angulo
             st.rerun()
+
 else:
-    st.error("Error crítico de ingesta: No se pudieron sincronizar los datos de la API de Binance.")
+    # -----------------------------------------------------------
+    # INTERFAZ DE AUDITORÍA Y RECUPERACIÓN DE ESTADO (ANTI-LOCK)
+    # -----------------------------------------------------------
+    st.error("🚨 Error crítico de ingesta: Ejecución detenida por protección algorítmica.")
+    
+    with st.expander("🔍 Ver Log de Auditoría de Errores (State Management)", expanded=True):
+        st.write("El sistema ha detectado una anomalía en la conexión API y bloqueó el ciclo para prevenir un desbordamiento de memoria.")
+        for err in st.session_state["errores"]:
+            if err['tipo'] == "API_BINANCE":
+                st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
+                
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🔄 Limpiar Auditoría y Reintentar Conexión"):
+        # Purgamos el estado de error de la sesión y limpiamos la caché forzando una llamada nueva
+        st.session_state["errores"] = [e for e in st.session_state["errores"] if e["tipo"] != "API_BINANCE"]
+        get_binance_data.clear() 
+        st.rerun()
