@@ -10,51 +10,57 @@ import warnings
 from datetime import datetime, timedelta
 import os
 
-# Importación del módulo de latido (Heartbeat)
+# Módulo de latido (Heartbeat) en tiempo real
 from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. PROTOCOLO DE ESTADO Y PERSISTENCIA (JSON)
+# 0. PROTOCOLO DE ESTADO Y CONFIGURACIÓN (MULTI-ACTIVO)
 # ==========================================
 st.set_page_config(page_title="Alpha V6 Quant Dashboard", layout="wide")
 
-# Configuración por defecto
-default_config = {
-    "symbol": "BNBUSDT", "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 1.5,
-    "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
-}
+# Forzamos la recarga automática cada 60 segundos para vigilar el precio solo
+st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
-# Funciones de Persistencia I/O
-def cargar_settings():
+# Estructura base para inicializar un activo nuevo si no existe en el disco
+def generar_estructura_base_activo():
+    return {
+        "tf": "15m", 
+        "dias": 1, 
+        "angulo": 15, 
+        "sl_mult": 1.5,
+        "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
+    }
+
+# Carga global del archivo de persistencia
+def cargar_settings_globales():
     if os.path.exists("settings.json"):
         try:
             with open("settings.json", "r") as f:
                 return json.load(f)
         except Exception:
             pass
-    return default_config.copy()
+    # Si el archivo no existe, inicializamos el contenedor maestro
+    return {"activo_seleccionado": "BNBUSDT", "data_activos": {}}
 
-def guardar_settings():
+def guardar_settings_globales():
     try:
         with open("settings.json", "w") as f:
-            json.dump(st.session_state["config"], f)
+            json.dump(st.session_state["db_master"], f)
     except Exception as e:
         registrar_error("PERSISTENCIA", f"Error al guardar settings.json: {str(e)}")
 
-if "config" not in st.session_state:
-    st.session_state["config"] = cargar_settings()
-
-# Compatibilidad de estructura por si el JSON antiguo no tenía "alertas"
-if "alertas" not in st.session_state["config"]:
-    st.session_state["config"]["alertas"] = {"regimen": True, "cruce_mb": True, "cruce_ms": True}
+# Inicialización de la Base de Datos Maestra en la Sesión
+if "db_master" not in st.session_state:
+    st.session_state["db_master"] = cargar_settings_globales()
 
 if "errores" not in st.session_state:
     st.session_state["errores"] = []
 
-if "historial_alertas" not in st.session_state:
-    st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
+# Historial de candados anti-spam estructurado de forma independiente por activo
+if "historial_multi_activo" not in st.session_state:
+    st.session_state["historial_multi_activo"] = {}
 
 def registrar_error(tipo, detalle):
     st.session_state["errores"].append({"tipo": tipo, "detalle": detalle, "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
@@ -73,17 +79,8 @@ def reproducir_alerta_local(nombre_archivo):
             pass 
 
 # ==========================================
-# 1. LATIDO DEL CORAZÓN (HEARTBEAT EN TIEMPO REAL)
+# 1. CONTROL DE ASIGNACIÓN DINÁMICA DE MEMORIA
 # ==========================================
-# Forzamos a la aplicación a recargarse cada 60 segundos (60000 milisegundos)
-# Esto permite que la API de Binance se consulte sola y las alertas salten sin tocar el mouse.
-st_autorefresh(interval=60000, key="motor_vigilancia_activa")
-
-# ==========================================
-# 2. UI: BARRA LATERAL (CONFIGURACIÓN EN VIVO)
-# ==========================================
-st.sidebar.header("⚙️ Parámetros de Auditoría")
-
 top_20_cryptos = {
     "Bitcoin (BTC)": "BTCUSDT", "Ethereum (ETH)": "ETHUSDT", "Binance Coin (BNB)": "BNBUSDT",
     "Solana (SOL)": "SOLUSDT", "Ripple (XRP)": "XRPUSDT", "Cardano (ADA)": "ADAUSDT",
@@ -94,56 +91,72 @@ top_20_cryptos = {
     "Aptos (APT)": "APTUSDT", "Sui (SUI)": "SUIUSDT", "Internet Computer (ICP)": "ICPUSDT"
 }
 
-# Usamos on_change=guardar_settings para que cada clic se guarde físicamente en el disco
-crypto_seleccionada = st.sidebar.selectbox("Seleccionar Criptomoneda", list(top_20_cryptos.keys()), index=list(top_20_cryptos.values()).index(st.session_state["config"]["symbol"]))
+# Barra Lateral: Selector de Criptomoneda
+crypto_seleccionada = st.sidebar.selectbox(
+    "Seleccionar Criptomoneda", 
+    list(top_20_cryptos.keys()), 
+    index=list(top_20_cryptos.values()).index(st.session_state["db_master"]["activo_seleccionado"])
+)
 
-if st.session_state["config"]["symbol"] != top_20_cryptos[crypto_seleccionada]:
-    st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
-    st.session_state["config"]["symbol"] = top_20_cryptos[crypto_seleccionada]
-    guardar_settings()
+symbol_actual = top_20_cryptos[crypto_seleccionada]
+st.session_state["db_master"]["activo_seleccionado"] = symbol_actual
 
+# CÉLULA DE MEMORIA: Si el activo no está registrado en el JSON, le creamos su propia configuración limpia
+if symbol_actual not in st.session_state["db_master"]["data_activos"]:
+    st.session_state["db_master"]["data_activos"][symbol_actual] = generar_estructura_base_activo()
+    guardar_settings_globales()
+
+# Extraemos de la memoria la configuración exclusiva de ESTE activo seleccionado
+cfg_activo = st.session_state["db_master"]["data_activos"][symbol_actual]
+
+# Inicializamos el candado anti-spam para este activo específico si es la primera vez que se carga
+if symbol_actual not in st.session_state["historial_multi_activo"]:
+    st.session_state["historial_multi_activo"][symbol_actual] = {"time": None, "reg": False, "mb": False, "ms": False}
+
+# ==========================================
+# 2. UI SIDEBAR: PARÁMETROS ENLAZADOS AL ACTIVO ACTUAL
+# ==========================================
 opciones_tf = {"15 Minutos": "15m", "1 Hora": "1h", "4 Horas": "4h", "1 Día": "1d"}
-tf_seleccionado = st.sidebar.selectbox("Temporalidad del Gráfico", list(opciones_tf.keys()), index=list(opciones_tf.values()).index(st.session_state["config"]["tf"]))
-if st.session_state["config"]["tf"] != opciones_tf[tf_seleccionado]:
-    st.session_state["config"]["tf"] = opciones_tf[tf_seleccionado]
-    guardar_settings()
+tf_seleccionado = st.sidebar.selectbox("Temporalidad del Gráfico", list(opciones_tf.keys()), index=list(opciones_tf.values()).index(cfg_activo["tf"]))
+if cfg_activo["tf"] != opciones_tf[tf_seleccionado]:
+    cfg_activo["tf"] = opciones_tf[tf_seleccionado]
+    guardar_settings_globales()
 
 opciones_dias = {"1 Día": 1, "2 Días": 2, "3 Días": 3, "1 Semana": 7, "1 Mes (30d)": 30, "2 Meses (60d)": 60, "3 Meses (90d)": 90}
-dias_seleccionados = st.sidebar.selectbox("Rango de Historial (Visualización)", list(opciones_dias.keys()), index=list(opciones_dias.values()).index(st.session_state["config"]["dias"]))
-if st.session_state["config"]["dias"] != opciones_dias[dias_seleccionados]:
-    st.session_state["config"]["dias"] = opciones_dias[dias_seleccionados]
-    guardar_settings()
+dias_seleccionados = st.sidebar.selectbox("Rango de Historial (Visualización)", list(opciones_dias.keys()), index=list(opciones_dias.values()).index(cfg_activo["dias"]))
+if cfg_activo["dias"] != opciones_dias[dias_seleccionados]:
+    cfg_activo["dias"] = opciones_dias[dias_seleccionados]
+    guardar_settings_globales()
 
-sl_val = st.sidebar.slider("Multiplicador ATR (Stop Loss)", min_value=0.5, max_value=3.0, value=st.session_state["config"]["sl_mult"], step=0.1)
-if st.session_state["config"]["sl_mult"] != sl_val:
-    st.session_state["config"]["sl_mult"] = sl_val
-    guardar_settings()
+sl_val = st.sidebar.slider("Multiplicador ATR (Stop Loss)", min_value=0.5, max_value=3.0, value=cfg_activo["sl_mult"], step=0.1)
+if cfg_activo["sl_mult"] != sl_val:
+    cfg_activo["sl_mult"] = sl_val
+    guardar_settings_globales()
 
-with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
-    st.markdown(f"<small>Vigilancia activa 24/7 en disco</small>", unsafe_allow_html=True)
+with st.sidebar.expander(f"🔔 Alertas Guardadas para {crypto_seleccionada}", expanded=True):
+    st.markdown("<small>Cada casilla se guarda de forma independiente</small>", unsafe_allow_html=True)
     
-    # Checkboxes conectados directamente a la función de guardado
-    reg_val = st.checkbox("Cambio de Régimen (0/1/2)", value=st.session_state["config"]["alertas"]["regimen"])
-    if st.session_state["config"]["alertas"]["regimen"] != reg_val:
-        st.session_state["config"]["alertas"]["regimen"] = reg_val
-        guardar_settings()
+    reg_val = st.checkbox("Cambio de Régimen (0/1/2)", value=cfg_activo["alertas"]["regimen"])
+    if cfg_activo["alertas"]["regimen"] != reg_val:
+        cfg_activo["alertas"]["regimen"] = reg_val
+        guardar_settings_globales()
         
-    mb_val = st.checkbox("Cruce Alcista (Rompe MediaBuy)", value=st.session_state["config"]["alertas"]["cruce_mb"])
-    if st.session_state["config"]["alertas"]["cruce_mb"] != mb_val:
-        st.session_state["config"]["alertas"]["cruce_mb"] = mb_val
-        guardar_settings()
+    mb_val = st.checkbox("Cruce Alcista (Rompe MediaBuy)", value=cfg_activo["alertas"]["cruce_mb"])
+    if cfg_activo["alertas"]["cruce_mb"] != mb_val:
+        cfg_activo["alertas"]["cruce_mb"] = mb_val
+        guardar_settings_globales()
         
-    ms_val = st.checkbox("Cruce Bajista (Rompe MediaSell)", value=st.session_state["config"]["alertas"]["cruce_ms"])
-    if st.session_state["config"]["alertas"]["cruce_ms"] != ms_val:
-        st.session_state["config"]["alertas"]["cruce_ms"] = ms_val
-        guardar_settings()
+    ms_val = st.checkbox("Cruce Bajista (Rompe MediaSell)", value=cfg_activo["alertas"]["cruce_ms"])
+    if cfg_activo["alertas"]["cruce_ms"] != ms_val:
+        cfg_activo["alertas"]["cruce_ms"] = ms_val
+        guardar_settings_globales()
 
-ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
+ticker_activo = symbol_actual.replace("USDT", "")
 
 # ==========================================
-# 3. INGESTA DE SEÑAL (ENRUTADOR MULTI-EXCHANGE)
+# 3. INGESTA DE SEÑAL DE ALTA DISPONIBILIDAD
 # ==========================================
-@st.cache_data(ttl=50, show_spinner=False) # Reducido a 50s para sincronizar con el auto-refresh
+@st.cache_data(ttl=50, show_spinner=False)
 def get_market_data(symbol, interval, dias_visuales):
     if verificar_error("BLOQUEO_CATASTROFICO"): return pd.DataFrame()
 
@@ -174,11 +187,13 @@ def get_market_data(symbol, interval, dias_visuales):
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
                 df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
                 temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
-            except Exception as e:
+            except Exception:
                 exito_motor = False; break
                 
         if exito_motor and df_list_temp:
             df_list = df_list_temp
+            if nombre_motor != "BINANCE_GLOBAL":
+                registrar_error("INFO_FAILOVER", f"Evasión IP exitosa usando el nodo {nombre_motor} para {symbol}")
             break
             
     if not df_list: 
@@ -194,7 +209,7 @@ def get_market_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 4. MOTOR CUANTITATIVO 
+# 4. MOTOR CUANTITATIVO (PROCESAMIENTO)
 # ==========================================
 def calcular_estrategia(df, angulo_requerido, sl_mult):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
@@ -252,10 +267,8 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     
     trades = []
     in_trade, entry_p, sl_price, cruce_latch = False, 0, 0, False 
-    
     for i in range(1, len(df)):
         if df['CruceDetectado'].iloc[i]: cruce_latch = True
-
         if not in_trade and df['Signal'].iloc[i] == 1:
             in_trade, entry_p, sl_price, cruce_latch = True, df['Close'].iloc[i], df['Close'].iloc[i] - (df['ATR'].iloc[i] * sl_mult), False 
             entry_t = df.index[i]
@@ -275,54 +288,51 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 5. RENDERIZADO VISUAL, TOASTS Y AUDITORÍA
+# 5. EXEC RENDER VISUAL Y DISPARO CELULAR AISLADO
 # ==========================================
-df_raw = get_market_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
+df_raw = get_market_data(symbol_actual, cfg_activo["tf"], cfg_activo["dias"])
 
 if not df_raw.empty:
-    df_full, trades_df_full, kmeans_model = calcular_estrategia(df_raw.copy(), st.session_state["config"]["angulo"], st.session_state["config"]["sl_mult"])
+    df_full, trades_df_full, kmeans_model = calcular_estrategia(df_raw.copy(), cfg_activo["angulo"], cfg_activo["sl_mult"])
     
-    # -----------------------------------------------------------
-    # LÓGICA DE ACTIVACIÓN DE ALERTAS EN TIEMPO REAL
-    # -----------------------------------------------------------
+    # -----------------------------------------------------------------
+    # CORRECCIÓN DE CERRADURA: MONITOREO TOTALMENTE AISLADO POR PAR
+    # -----------------------------------------------------------------
     ultimo_tiempo_vela = df_full.index[-1]
-    cfg_alertas = st.session_state["config"]["alertas"]
-    hist = st.session_state["historial_alertas"]
+    hist = st.session_state["historial_multi_activo"][symbol_actual]
 
-    # Si entramos en una nueva vela (evaluación edge), reseteamos los candados
+    # Si la vela para ESTA moneda avanzó en el tiempo, liberamos sus candados exclusivos
     if hist["time"] != ultimo_tiempo_vela:
         hist["time"] = ultimo_tiempo_vela
         hist["reg"], hist["mb"], hist["ms"] = False, False, False
 
-    # Disparadores condicionados: Solo suenan si la casilla está marcada en el JSON
-    if cfg_alertas["regimen"] and df_full['Regime_Start'].iloc[-1] and not hist["reg"]:
+    # Evaluación y ejecución (solo lee el canal de alertas de ESTA moneda)
+    if cfg_activo["alertas"]["regimen"] and df_full['Regime_Start'].iloc[-1] and not hist["reg"]:
         st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
-        reproducir_alerta_local("alerta_regimen.mp3")
-        hist["reg"] = True
+        reproducir_alerta_local("alerta_regimen.mp3"); hist["reg"] = True
         
-    if cfg_alertas["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
+    if cfg_activo["alertas"]["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Cruce ALCISTA sobre MediaBuy", icon="🟢")
-        reproducir_alerta_local("alerta_alcista.mp3")
-        hist["mb"] = True
+        reproducir_alerta_local("alerta_alcista.mp3"); hist["mb"] = True
         
-    if cfg_alertas["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
+    if cfg_activo["alertas"]["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
         st.toast(f"**{ticker_activo}**: Cruce BAJISTA bajo MediaSell", icon="🔴")
-        reproducir_alerta_local("alerta_bajista.mp3")
-        hist["ms"] = True
+        reproducir_alerta_local("alerta_bajista.mp3"); hist["ms"] = True
+    # -----------------------------------------------------------------
 
-    fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=st.session_state["config"]["dias"])
+    fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=cfg_activo["dias"])
     df = df_full[df_full.index >= fecha_corte].copy()
     trades_df = trades_df_full[trades_df_full['Entry_Time'] >= fecha_corte].copy() if not trades_df_full.empty else pd.DataFrame()
 
     last_time, last_price, last_mb, last_ms = df.index[-1], df['Close'].iloc[-1], df['MediaBuy'].iloc[-1], df['MediaSell'].iloc[-1]
 
-    st.subheader(f"Simulador Alpha V6 - {crypto_seleccionada} ({tf_seleccionado})")
+    st.subheader(f"Simulador Alpha V6 - {crypto_seleccionada} ({cfg_activo['tf']})")
     
     if len(st.session_state["errores"]) > 0:
-        with st.expander("🔍 Registro de Auditoría", expanded=False):
+        with st.expander("🔍 Registro de Auditoría de Red", expanded=False):
             for err in st.session_state["errores"]:
-                st.warning(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
-            if st.button("Limpiar Registro"):
+                st.info(f"[{err['timestamp']}] {err['tipo']} -> {err['details' if 'details' in err else 'detalle']}")
+            if st.button("Limpiar Logs"):
                 st.session_state["errores"] = []; st.rerun()
 
     fig = make_subplots(rows=1, cols=1)
@@ -382,11 +392,10 @@ if not df_raw.empty:
         c3.metric("Estado de Señal", estado_actual)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        nuevo_angulo = st.slider("Sensibilidad del Escudo Cinético (Ángulo)", min_value=0, max_value=85, value=st.session_state["config"]["angulo"], step=5, key="slider_inferior")
-        if nuevo_angulo != st.session_state["config"]["angulo"]:
-            st.session_state["config"]["angulo"] = nuevo_angulo
-            guardar_settings() # Guardado local al mover el slider
+        nuevo_angulo = st.slider("Sensibilidad del Escudo Cinético (Ángulo)", min_value=0, max_value=85, value=cfg_activo["angulo"], step=5, key="slider_inferior")
+        if nuevo_angulo != cfg_activo["angulo"]:
+            cfg_activo["angulo"] = nuevo_angulo
+            guardar_settings_globales()
             st.rerun()
-
 else:
-    st.error("🚨 Error crítico: Conexión rechazada por los motores.")
+    st.error("🚨 Error crítico de red en la infraestructura Cloud.")
