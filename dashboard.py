@@ -17,14 +17,9 @@ warnings.filterwarnings("ignore")
 # ==========================================
 st.set_page_config(page_title="Alpha V6 Quant Dashboard", layout="wide")
 
-# 1. Filtro de Memoria e Inicialización (State Management Robusto)
 if "config" not in st.session_state:
     st.session_state["config"] = {
-        "symbol": "BNBUSDT", 
-        "tf": "15m", 
-        "dias": 1, 
-        "angulo": 15, 
-        "sl_mult": 1.5,
+        "symbol": "BNBUSDT", "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 1.5,
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 elif "alertas" not in st.session_state["config"]:
@@ -37,17 +32,12 @@ if "historial_alertas" not in st.session_state:
     st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
 
 def registrar_error(tipo, detalle):
-    st.session_state["errores"].append({
-        "tipo": tipo, 
-        "detalle": detalle, 
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    })
+    st.session_state["errores"].append({"tipo": tipo, "detalle": detalle, "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
 
 def verificar_error(tipo):
     return any(e["tipo"] == tipo for e in st.session_state["errores"])
 
 def reproducir_alerta_local(nombre_archivo):
-    """Reproduce el audio si el archivo existe físicamente en el repositorio (GitHub/Local)."""
     if os.path.exists(nombre_archivo):
         try:
             with open(nombre_archivo, "rb") as f:
@@ -55,7 +45,7 @@ def reproducir_alerta_local(nombre_archivo):
             with st.sidebar:
                 st.audio(audio_bytes, format="audio/mp3", autoplay=True)
         except Exception:
-            pass # Falla silenciosa si el archivo está corrupto
+            pass 
 
 # ==========================================
 # 1. UI: BARRA LATERAL (CONFIGURACIÓN EN VIVO)
@@ -89,7 +79,6 @@ st.session_state["config"]["dias"] = opciones_dias[dias_seleccionados]
 st.session_state["config"]["sl_mult"] = st.sidebar.slider("Multiplicador ATR (Stop Loss)", min_value=0.5, max_value=3.0, value=st.session_state["config"]["sl_mult"], step=0.1)
 
 with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
-    st.markdown(f"<small>Alertas activas para: <b>{crypto_seleccionada}</b></small>", unsafe_allow_html=True)
     st.session_state["config"]["alertas"]["regimen"] = st.checkbox("Cambio de Régimen (0/1/2)", value=st.session_state["config"]["alertas"]["regimen"])
     st.session_state["config"]["alertas"]["cruce_mb"] = st.checkbox("Cruce Alcista (Rompe MediaBuy)", value=st.session_state["config"]["alertas"]["cruce_mb"])
     st.session_state["config"]["alertas"]["cruce_ms"] = st.checkbox("Cruce Bajista (Rompe MediaSell)", value=st.session_state["config"]["alertas"]["cruce_ms"])
@@ -97,12 +86,11 @@ with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
 ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE SEÑAL (ENRUTADOR MULTI-EXCHANGE A PRUEBA DE FALLOS)
+# 2. INGESTA DE SEÑAL (ENRUTADOR MULTI-EXCHANGE CLOUD)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False) 
 def get_market_data(symbol, interval, dias_visuales):
-    if verificar_error("BLOQUEO_CATASTROFICO"): 
-        return pd.DataFrame()
+    if verificar_error("BLOQUEO_CATASTROFICO"): return pd.DataFrame()
 
     buffer_dias = {"15m": 3, "1h": 10, "4h": 40, "1d": 250}.get(interval, 5)
     dias_totales = dias_visuales + buffer_dias
@@ -111,11 +99,10 @@ def get_market_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
-    # Arquitectura Definitiva: Motores con esquemas JSON idénticos
     motores = [
         ("BINANCE_GLOBAL", "api.binance.com"),
-        ("BINANCE_US", "api.binance.us"), # Bypass para Streamlit Cloud en EEUU
-        ("MEXC_OFFSHORE", "api.mexc.com") # Respaldo sin geobloqueo
+        ("BINANCE_US", "api.binance.us"), 
+        ("MEXC_OFFSHORE", "api.mexc.com") 
     ]
     
     df_list = []
@@ -124,7 +111,6 @@ def get_market_data(symbol, interval, dias_visuales):
         df_list_temp = []
         temp_start = current_start
         exito_motor = True
-        error_msg = ""
         
         while temp_start < end_time_ms:
             url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={temp_start}"
@@ -138,35 +124,30 @@ def get_market_data(symbol, interval, dias_visuales):
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
                 df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
                 temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
-                
             except Exception as e:
                 exito_motor = False
-                error_msg = str(e)
                 break
                 
         if exito_motor and df_list_temp:
             df_list = df_list_temp
-            # Si usamos un motor de respaldo, lo registramos pero seguimos adelante
             if nombre_motor != "BINANCE_GLOBAL":
-                registrar_error("INFO_FAILOVER", f"Conectado exitosamente a través de {nombre_motor}")
+                registrar_error("INFO_FAILOVER", f"Conectado a través de {nombre_motor} (evasión de IP exitosa)")
             break
-        else:
-            registrar_error("INFO_NODO_CAIDO", f"Nodo {dominio} falló: {error_msg}")
             
     if not df_list: 
-        registrar_error("BLOQUEO_CATASTROFICO", "Todos los motores de liquidez rechazaron la conexión (Posible baneo total de IP Cloud).")
+        registrar_error("BLOQUEO_CATASTROFICO", "Todos los motores de liquidez rechazaron la conexión IP.")
         st.cache_data.clear()
         return pd.DataFrame()
     
     df = pd.concat(df_list, ignore_index=True)
     df.drop_duplicates(subset=['Open_time'], inplace=True)
     df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
-    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5) # Sincronización Ecuador (UTC-5)
+    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5)
     df.set_index('Date', inplace=True)
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO (PROCESAMIENTO DE SEÑALES)
+# 3. MOTOR CUANTITATIVO 
 # ==========================================
 def calcular_estrategia(df, angulo_requerido, sl_mult):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
@@ -196,17 +177,13 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
         
     df['MediaBuy'], df['MediaSell'] = media_buy, media_sell
 
-    df['Cruce_MB_Alcista'] = (df['Close'].shift(1) <= df['MediaBuy'].shift(1)) & (df['Close'] > df['MediaBuy'])
-    df['Cruce_MS_Bajista'] = (df['Close'].shift(1) >= df['MediaSell'].shift(1)) & (df['Close'] < df['MediaSell'])
-
     df['Returns'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol'] = df['Returns'].rolling(96).std()
     df['Mom'] = df['Close'].pct_change(96)
     
     df_temp = df.dropna().copy()
     if len(df_temp) < 10:
-        df['Regime'] = 0
-        kmeans = None
+        df['Regime'] = 0; kmeans = None
     else:
         kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
         df.loc[df_temp.index, 'Regime'] = kmeans.fit_predict(df_temp[['Vol', 'Returns', 'Mom']].values)
@@ -223,6 +200,8 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     vela_verde = df['Close'] > df['Open']
     toque_zona = (df['Low'] <= df['MediaBuy']) | (df['Low'].shift(1) <= df['MediaBuy'].shift(1))
     df['Buy_Trigger'] = toque_zona & vela_verde & (df['Close'] > df['MediaBuy']) & (df['yhat1'] > df['yhat1'].shift(1)) & (df['Angle'] >= angulo_requerido)
+    df['Cruce_MB_Alcista'] = (df['Close'].shift(1) <= df['MediaBuy'].shift(1)) & (df['Close'] > df['MediaBuy'])
+    df['Cruce_MS_Bajista'] = (df['Close'].shift(1) >= df['MediaSell'].shift(1)) & (df['Close'] < df['MediaSell'])
     df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
     
     trades = []
@@ -250,7 +229,7 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 4. RENDERIZADO VISUAL & GESTIÓN DE MÉTRICAS
+# 4. RENDERIZADO VISUAL Y MÉTRICAS
 # ==========================================
 df_raw = get_market_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
 
@@ -262,26 +241,19 @@ if not df_raw.empty:
     hist = st.session_state["historial_alertas"]
 
     if hist["time"] != ultimo_tiempo_vela:
-        hist["time"] = ultimo_tiempo_vela
-        hist["reg"], hist["mb"], hist["ms"] = False, False, False
+        hist["time"] = ultimo_tiempo_vela; hist["reg"] = False; hist["mb"] = False; hist["ms"] = False
 
     if cfg_alertas["regimen"] and df_full['Regime_Start'].iloc[-1] and not hist["reg"]:
         st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
-        reproducir_alerta_local("alerta_regimen.ogg")
-        reproducir_alerta_local("alerta_regimen.mp3") # Respaldo por si subes mp3
-        hist["reg"] = True
+        reproducir_alerta_local("alerta_regimen.mp3"); hist["reg"] = True
         
     if cfg_alertas["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Cruce ALCISTA sobre MediaBuy", icon="🟢")
-        reproducir_alerta_local("alerta_alcista.ogg")
-        reproducir_alerta_local("alerta_alcista.mp3")
-        hist["mb"] = True
+        reproducir_alerta_local("alerta_alcista.mp3"); hist["mb"] = True
         
     if cfg_alertas["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
         st.toast(f"**{ticker_activo}**: Cruce BAJISTA bajo MediaSell", icon="🔴")
-        reproducir_alerta_local("alerta_bajista.ogg")
-        reproducir_alerta_local("alerta_bajista.mp3")
-        hist["ms"] = True
+        reproducir_alerta_local("alerta_bajista.mp3"); hist["ms"] = True
 
     fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=st.session_state["config"]["dias"])
     df = df_full[df_full.index >= fecha_corte].copy()
@@ -291,20 +263,12 @@ if not df_raw.empty:
 
     st.subheader(f"Simulador Alpha V6 - {crypto_seleccionada} ({tf_seleccionado})")
     
-    # -----------------------------------------------------------
-    # EXPOSICIÓN DEL AUDIT LOG EN VIVO
-    # -----------------------------------------------------------
     if len(st.session_state["errores"]) > 0:
-        with st.expander("🔍 Registro de Auditoría y Routing de Estado", expanded=False):
+        with st.expander("🔍 Registro de Ruteo de Conexión (Logs)", expanded=False):
             for err in st.session_state["errores"]:
-                if "INFO" in err['tipo']:
-                    st.info(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
-                else:
-                    st.warning(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
-            if st.button("Limpiar Registro de Auditoría"):
-                st.session_state["errores"] = []
-                st.rerun()
-    # -----------------------------------------------------------
+                st.info(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
+            if st.button("Limpiar Logs"):
+                st.session_state["errores"] = []; st.rerun()
 
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name=ticker_activo, line=dict(color='gray', width=1)))
@@ -369,13 +333,8 @@ if not df_raw.empty:
             st.rerun()
 
 else:
-    st.error("🚨 Error crítico de ingesta: Ejecución detenida por protección algorítmica.")
-    with st.expander("🔍 Ver Log de Auditoría de Errores", expanded=True):
-        for err in st.session_state["errores"]:
-            st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
-                
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🔄 Limpiar Auditoría y Reintentar Conexión"):
+    st.error("🚨 Error crítico: Conexión rechazada por los 3 motores (Binance, Binance US y MEXC).")
+    if st.button("🔄 Reintentar Conexión"):
         st.session_state["errores"] = []
         get_market_data.clear() 
         st.rerun()
