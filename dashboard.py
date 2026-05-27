@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore")
 # ==========================================
 st.set_page_config(page_title="Alpha V6 Quant Dashboard", layout="wide")
 
+# 1. Filtro de Memoria e Inicialización (State Management Robusto)
 if "config" not in st.session_state:
     st.session_state["config"] = {
         "symbol": "BNBUSDT", 
@@ -45,33 +46,16 @@ def registrar_error(tipo, detalle):
 def verificar_error(tipo):
     return any(e["tipo"] == tipo for e in st.session_state["errores"])
 
-# -----------------------------------------------------------
-# PROVISIONAMIENTO DE AUDIOS AUTOMÁTICO
-# -----------------------------------------------------------
-def inicializar_recursos_audio():
-    audios_institucionales = {
-        "alerta_alcista.ogg": "https://actions.google.com/sounds/v1/alarms/beeps_and_flashes.ogg",
-        "alerta_bajista.ogg": "https://actions.google.com/sounds/v1/alarms/buzzer_alarm.ogg",
-        "alerta_regimen.ogg": "https://actions.google.com/sounds/v1/water/droplet_reverb.ogg"
-    }
-    for nombre_archivo, url in audios_institucionales.items():
-        if not os.path.exists(nombre_archivo):
-            try:
-                urllib.request.urlretrieve(url, nombre_archivo)
-            except Exception as e:
-                registrar_error("RECURSOS_AUDIO", f"Fallo al descargar {nombre_archivo}: {str(e)}")
-
-inicializar_recursos_audio()
-
 def reproducir_alerta_local(nombre_archivo):
-    if os.path.exists(nombre_archivo) and not verificar_error("RECURSOS_AUDIO"):
+    """Reproduce el audio si el archivo existe físicamente en el repositorio (GitHub/Local)."""
+    if os.path.exists(nombre_archivo):
         try:
             with open(nombre_archivo, "rb") as f:
                 audio_bytes = f.read()
             with st.sidebar:
-                st.audio(audio_bytes, format="audio/ogg", autoplay=True)
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
         except Exception:
-            pass
+            pass # Falla silenciosa si el archivo está corrupto
 
 # ==========================================
 # 1. UI: BARRA LATERAL (CONFIGURACIÓN EN VIVO)
@@ -113,7 +97,7 @@ with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
 ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE DATOS (ENRUTADOR FAILOVER DUAL)
+# 2. INGESTA DE SEÑAL (ENRUTADOR MULTI-EXCHANGE A PRUEBA DE FALLOS)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False) 
 def get_market_data(symbol, interval, dias_visuales):
@@ -127,64 +111,62 @@ def get_market_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
-    ms_step = {"15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000}.get(interval, 900000)
-    df_list = []
-    motor_activo = "BINANCE"
+    # Arquitectura Definitiva: Motores con esquemas JSON idénticos
+    motores = [
+        ("BINANCE_GLOBAL", "api.binance.com"),
+        ("BINANCE_US", "api.binance.us"), # Bypass para Streamlit Cloud en EEUU
+        ("MEXC_OFFSHORE", "api.mexc.com") # Respaldo sin geobloqueo
+    ]
     
-    while current_start < end_time_ms:
-        if motor_activo == "BINANCE":
-            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={current_start}"
+    df_list = []
+    
+    for nombre_motor, dominio in motores:
+        df_list_temp = []
+        temp_start = current_start
+        exito_motor = True
+        error_msg = ""
+        
+        while temp_start < end_time_ms:
+            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={temp_start}"
             try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/6.0'})
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/7.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
                     data = json.loads(response.read().decode())
+                
                 if not data: break
                 
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
-                df_list.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
-                current_start = int(df_temp['Close_time'].iloc[-1]) + 1
+                df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
+                temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
                 
             except Exception as e:
-                # Ante cualquier error de IP (451/403) de AWS/Streamlit Cloud, conmutamos el motor
-                motor_activo = "BYBIT"
-                registrar_error("INFO_FAILOVER", f"Anomalía en Binance detectada ({str(e)}). Conmutando flujo de datos a Bybit API.")
-                continue
-                
-        elif motor_activo == "BYBIT":
-            mapa_bybit = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-            bybit_interval = mapa_bybit.get(interval, "15")
-            url_bybit = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_interval}&start={current_start}&limit=1000"
-            
-            try:
-                req = urllib.request.Request(url_bybit, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/6.0'})
-                with urllib.request.urlopen(req, timeout=8) as response:
-                    data = json.loads(response.read().decode())
-                    
-                if data['retCode'] != 0 or not data['result']['list']:
-                    break
-                    
-                klines = data['result']['list'][::-1] # Bybit retorna en orden descendente, lo invertimos
-                df_temp = pd.DataFrame(klines, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover'])
-                df_list.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
-                current_start = int(df_temp['Open_time'].iloc[-1]) + ms_step
-                
-            except Exception as e:
-                registrar_error("BLOQUEO_CATASTROFICO", f"Fallo en motor de respaldo (Bybit): {str(e)}. Ingesta abortada.")
+                exito_motor = False
+                error_msg = str(e)
                 break
                 
+        if exito_motor and df_list_temp:
+            df_list = df_list_temp
+            # Si usamos un motor de respaldo, lo registramos pero seguimos adelante
+            if nombre_motor != "BINANCE_GLOBAL":
+                registrar_error("INFO_FAILOVER", f"Conectado exitosamente a través de {nombre_motor}")
+            break
+        else:
+            registrar_error("INFO_NODO_CAIDO", f"Nodo {dominio} falló: {error_msg}")
+            
     if not df_list: 
+        registrar_error("BLOQUEO_CATASTROFICO", "Todos los motores de liquidez rechazaron la conexión (Posible baneo total de IP Cloud).")
         st.cache_data.clear()
         return pd.DataFrame()
     
     df = pd.concat(df_list, ignore_index=True)
     df.drop_duplicates(subset=['Open_time'], inplace=True)
     df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
-    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5) # Sincronización UTC-5
+    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5) # Sincronización Ecuador (UTC-5)
     df.set_index('Date', inplace=True)
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO
+# 3. MOTOR CUANTITATIVO (PROCESAMIENTO DE SEÑALES)
 # ==========================================
 def calcular_estrategia(df, angulo_requerido, sl_mult):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
@@ -268,7 +250,7 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 4. RENDERIZADO VISUAL, TOASTS Y AUDITORÍA
+# 4. RENDERIZADO VISUAL & GESTIÓN DE MÉTRICAS
 # ==========================================
 df_raw = get_market_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
 
@@ -286,16 +268,19 @@ if not df_raw.empty:
     if cfg_alertas["regimen"] and df_full['Regime_Start'].iloc[-1] and not hist["reg"]:
         st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
         reproducir_alerta_local("alerta_regimen.ogg")
+        reproducir_alerta_local("alerta_regimen.mp3") # Respaldo por si subes mp3
         hist["reg"] = True
         
     if cfg_alertas["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Cruce ALCISTA sobre MediaBuy", icon="🟢")
         reproducir_alerta_local("alerta_alcista.ogg")
+        reproducir_alerta_local("alerta_alcista.mp3")
         hist["mb"] = True
         
     if cfg_alertas["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
         st.toast(f"**{ticker_activo}**: Cruce BAJISTA bajo MediaSell", icon="🔴")
         reproducir_alerta_local("alerta_bajista.ogg")
+        reproducir_alerta_local("alerta_bajista.mp3")
         hist["ms"] = True
 
     fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=st.session_state["config"]["dias"])
@@ -307,13 +292,13 @@ if not df_raw.empty:
     st.subheader(f"Simulador Alpha V6 - {crypto_seleccionada} ({tf_seleccionado})")
     
     # -----------------------------------------------------------
-    # EXPOSICIÓN DEL AUDIT LOG EN VIVO (SIN BLOQUEAR UI)
+    # EXPOSICIÓN DEL AUDIT LOG EN VIVO
     # -----------------------------------------------------------
     if len(st.session_state["errores"]) > 0:
         with st.expander("🔍 Registro de Auditoría y Routing de Estado", expanded=False):
             for err in st.session_state["errores"]:
-                if err['tipo'] == "INFO_FAILOVER":
-                    st.info(f"[{err['timestamp']}] RUTEO -> {err['detalle']}")
+                if "INFO" in err['tipo']:
+                    st.info(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
                 else:
                     st.warning(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
             if st.button("Limpiar Registro de Auditoría"):
@@ -384,13 +369,8 @@ if not df_raw.empty:
             st.rerun()
 
 else:
-    # -----------------------------------------------------------
-    # FALLO CATASTRÓFICO (AMBOS MOTORES CAÍDOS)
-    # -----------------------------------------------------------
     st.error("🚨 Error crítico de ingesta: Ejecución detenida por protección algorítmica.")
-    
-    with st.expander("🔍 Ver Log de Auditoría de Errores (State Management)", expanded=True):
-        st.write("El sistema ha agotado todas las instancias de respaldo y bloqueó el ciclo para prevenir desbordamientos.")
+    with st.expander("🔍 Ver Log de Auditoría de Errores", expanded=True):
         for err in st.session_state["errores"]:
             st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
                 
