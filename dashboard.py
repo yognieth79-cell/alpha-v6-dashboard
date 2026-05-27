@@ -36,8 +36,11 @@ if "historial_alertas" not in st.session_state:
     st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
 
 def registrar_error(tipo, detalle):
-    # Formateo de timestamp para el Audit Log visual
-    st.session_state["errores"].append({"tipo": tipo, "detalle": detalle, "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
+    st.session_state["errores"].append({
+        "tipo": tipo, 
+        "detalle": detalle, 
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 def verificar_error(tipo):
     return any(e["tipo"] == tipo for e in st.session_state["errores"])
@@ -110,11 +113,11 @@ with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
 ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE DATOS (ROTACIÓN DE NODOS Y EVASIÓN CLOUD)
+# 2. INGESTA DE DATOS (ENRUTADOR FAILOVER DUAL)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False) 
-def get_binance_data(symbol, interval, dias_visuales):
-    if verificar_error("API_BINANCE"): 
+def get_market_data(symbol, interval, dias_visuales):
+    if verificar_error("BLOQUEO_CATASTROFICO"): 
         return pd.DataFrame()
 
     buffer_dias = {"15m": 3, "1h": 10, "4h": 40, "1d": 250}.get(interval, 5)
@@ -124,43 +127,51 @@ def get_binance_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
-    # Nodos oficiales de Binance para evadir bloqueos de DNS o Cloud IP
-    endpoints_binance = ["api.binance.com", "api1.binance.com", "api2.binance.com", "api3.binance.com", "api4.binance.com"]
+    ms_step = {"15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000}.get(interval, 900000)
     df_list = []
+    motor_activo = "BINANCE"
     
     while current_start < end_time_ms:
-        exito_nodo = False
-        ultimo_error_msg = ""
-        
-        for endpoint in endpoints_binance:
-            url = f"https://{endpoint}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={current_start}"
+        if motor_activo == "BINANCE":
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={current_start}"
             try:
-                # Simulamos un navegador estándar para evadir bloqueos básicos de scraping
-                req = urllib.request.Request(url, headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json'
-                })
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/6.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
                     data = json.loads(response.read().decode())
+                if not data: break
                 
-                if not data: 
-                    exito_nodo = True
-                    break
-                    
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
-                df_list.append(df_temp)
+                df_list.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
                 current_start = int(df_temp['Close_time'].iloc[-1]) + 1
-                exito_nodo = True
-                break  # Si el nodo funciona, rompemos el loop de rotación y seguimos descargando
                 
             except Exception as e:
-                ultimo_error_msg = f"{endpoint}: {str(e)}"
-                continue  # Si el nodo falla, intentamos con el siguiente
+                # Ante cualquier error de IP (451/403) de AWS/Streamlit Cloud, conmutamos el motor
+                motor_activo = "BYBIT"
+                registrar_error("INFO_FAILOVER", f"Anomalía en Binance detectada ({str(e)}). Conmutando flujo de datos a Bybit API.")
+                continue
                 
-        if not exito_nodo:
-            registrar_error("API_BINANCE", f"Bloqueo total de nodos. Último error reportado -> {ultimo_error_msg}")
-            break
+        elif motor_activo == "BYBIT":
+            mapa_bybit = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+            bybit_interval = mapa_bybit.get(interval, "15")
+            url_bybit = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_interval}&start={current_start}&limit=1000"
             
+            try:
+                req = urllib.request.Request(url_bybit, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha/6.0'})
+                with urllib.request.urlopen(req, timeout=8) as response:
+                    data = json.loads(response.read().decode())
+                    
+                if data['retCode'] != 0 or not data['result']['list']:
+                    break
+                    
+                klines = data['result']['list'][::-1] # Bybit retorna en orden descendente, lo invertimos
+                df_temp = pd.DataFrame(klines, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover'])
+                df_list.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
+                current_start = int(df_temp['Open_time'].iloc[-1]) + ms_step
+                
+            except Exception as e:
+                registrar_error("BLOQUEO_CATASTROFICO", f"Fallo en motor de respaldo (Bybit): {str(e)}. Ingesta abortada.")
+                break
+                
     if not df_list: 
         st.cache_data.clear()
         return pd.DataFrame()
@@ -168,7 +179,7 @@ def get_binance_data(symbol, interval, dias_visuales):
     df = pd.concat(df_list, ignore_index=True)
     df.drop_duplicates(subset=['Open_time'], inplace=True)
     df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
-    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5)
+    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5) # Sincronización UTC-5
     df.set_index('Date', inplace=True)
     return df
 
@@ -259,7 +270,7 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
 # ==========================================
 # 4. RENDERIZADO VISUAL, TOASTS Y AUDITORÍA
 # ==========================================
-df_raw = get_binance_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
+df_raw = get_market_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
 
 if not df_raw.empty:
     df_full, trades_df_full, kmeans_model = calcular_estrategia(df_raw.copy(), st.session_state["config"]["angulo"], st.session_state["config"]["sl_mult"])
@@ -295,6 +306,21 @@ if not df_raw.empty:
 
     st.subheader(f"Simulador Alpha V6 - {crypto_seleccionada} ({tf_seleccionado})")
     
+    # -----------------------------------------------------------
+    # EXPOSICIÓN DEL AUDIT LOG EN VIVO (SIN BLOQUEAR UI)
+    # -----------------------------------------------------------
+    if len(st.session_state["errores"]) > 0:
+        with st.expander("🔍 Registro de Auditoría y Routing de Estado", expanded=False):
+            for err in st.session_state["errores"]:
+                if err['tipo'] == "INFO_FAILOVER":
+                    st.info(f"[{err['timestamp']}] RUTEO -> {err['detalle']}")
+                else:
+                    st.warning(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
+            if st.button("Limpiar Registro de Auditoría"):
+                st.session_state["errores"] = []
+                st.rerun()
+    # -----------------------------------------------------------
+
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name=ticker_activo, line=dict(color='gray', width=1)))
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy'], name='MediaBuy', line=dict(color='#00e676', width=2)))
@@ -359,19 +385,17 @@ if not df_raw.empty:
 
 else:
     # -----------------------------------------------------------
-    # INTERFAZ DE AUDITORÍA Y RECUPERACIÓN DE ESTADO (ANTI-LOCK)
+    # FALLO CATASTRÓFICO (AMBOS MOTORES CAÍDOS)
     # -----------------------------------------------------------
     st.error("🚨 Error crítico de ingesta: Ejecución detenida por protección algorítmica.")
     
     with st.expander("🔍 Ver Log de Auditoría de Errores (State Management)", expanded=True):
-        st.write("El sistema ha detectado una anomalía en la conexión API y bloqueó el ciclo para prevenir un desbordamiento de memoria.")
+        st.write("El sistema ha agotado todas las instancias de respaldo y bloqueó el ciclo para prevenir desbordamientos.")
         for err in st.session_state["errores"]:
-            if err['tipo'] == "API_BINANCE":
-                st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
+            st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
                 
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Limpiar Auditoría y Reintentar Conexión"):
-        # Purgamos el estado de error de la sesión y limpiamos la caché forzando una llamada nueva
-        st.session_state["errores"] = [e for e in st.session_state["errores"] if e["tipo"] != "API_BINANCE"]
-        get_binance_data.clear() 
+        st.session_state["errores"] = []
+        get_market_data.clear() 
         st.rerun()
