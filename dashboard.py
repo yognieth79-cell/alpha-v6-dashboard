@@ -17,9 +17,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 st.set_page_config(page_title="Alpha V6 Quant Dashboard", layout="wide")
 
+# Inicialización rigurosa de la Memoria de Estado de Sesión
 if "config" not in st.session_state:
     st.session_state["config"] = {
-        "symbol": "BNBUSDT", "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 1.5,
+        "symbol": "BNBUSDT", 
+        "tf": "15m", 
+        "dias": 1, 
+        "angulo": 15, 
+        "sl_mult": 1.5,
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 elif "alertas" not in st.session_state["config"]:
@@ -38,41 +43,35 @@ def verificar_error(tipo):
     return any(e["tipo"] == tipo for e in st.session_state["errores"])
 
 # -----------------------------------------------------------
-# NUEVA FUNCIÓN: APROVISIONAMIENTO AUTOMÁTICO DE AUDIOS (ZERO-TOUCH)
+# PROVISIONAMIENTO DE AUDIOS AUTOMÁTICO (ANTI-LATENCIA)
 # -----------------------------------------------------------
 def inicializar_recursos_audio():
-    # Diccionario con URLs públicas de Google para sonidos libres de derechos (.ogg)
     audios_institucionales = {
         "alerta_alcista.ogg": "https://actions.google.com/sounds/v1/alarms/beeps_and_flashes.ogg",
         "alerta_bajista.ogg": "https://actions.google.com/sounds/v1/alarms/buzzer_alarm.ogg",
         "alerta_regimen.ogg": "https://actions.google.com/sounds/v1/water/droplet_reverb.ogg"
     }
-    
     for nombre_archivo, url in audios_institucionales.items():
-        # Si el archivo no existe en la carpeta donde está este script, lo descarga
         if not os.path.exists(nombre_archivo):
             try:
                 urllib.request.urlretrieve(url, nombre_archivo)
             except Exception as e:
                 registrar_error("RECURSOS_AUDIO", f"Fallo al descargar {nombre_archivo}: {str(e)}")
 
-# Ejecutamos el aprovisionamiento de forma silenciosa al arrancar
 inicializar_recursos_audio()
 
 def reproducir_alerta_local(nombre_archivo):
-    """Reproduce el archivo de audio específico en la barra lateral de forma invisible."""
-    if os.path.exists(nombre_archivo):
+    if os.path.exists(nombre_archivo) and not verificar_error("RECURSOS_AUDIO"):
         try:
             with open(nombre_archivo, "rb") as f:
                 audio_bytes = f.read()
-            # Inyección en el sidebar para no manchar la interfaz principal
             with st.sidebar:
                 st.audio(audio_bytes, format="audio/ogg", autoplay=True)
-        except Exception as e:
-            pass # Falla silenciosa de grado institucional
+        except Exception:
+            pass
 
 # ==========================================
-# 1. UI: BARRA LATERAL (AUDITORÍA Y ALERTAS)
+# 1. UI: BARRA LATERAL (CONFIGURACIÓN EN VIVO)
 # ==========================================
 st.sidebar.header("⚙️ Parámetros de Auditoría")
 
@@ -90,7 +89,6 @@ crypto_seleccionada = st.sidebar.selectbox("Seleccionar Criptomoneda", list(top_
 
 if st.session_state["config"]["symbol"] != top_20_cryptos[crypto_seleccionada]:
     st.session_state["historial_alertas"] = {"time": None, "reg": False, "mb": False, "ms": False}
-    
 st.session_state["config"]["symbol"] = top_20_cryptos[crypto_seleccionada]
 
 opciones_tf = {"15 Minutos": "15m", "1 Hora": "1h", "4 Horas": "4h", "1 Día": "1d"}
@@ -109,13 +107,10 @@ with st.sidebar.expander("🔔 Panel de Alertas In Situ", expanded=True):
     st.session_state["config"]["alertas"]["cruce_mb"] = st.checkbox("Cruce Alcista (Rompe MediaBuy)", value=st.session_state["config"]["alertas"]["cruce_mb"])
     st.session_state["config"]["alertas"]["cruce_ms"] = st.checkbox("Cruce Bajista (Rompe MediaSell)", value=st.session_state["config"]["alertas"]["cruce_ms"])
 
-if st.sidebar.button("Guardar Parámetros por Defecto"):
-    st.sidebar.success("Parámetros guardados en caché.")
-
 ticker_activo = st.session_state["config"]["symbol"].replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE DATOS (SINC. ECUADOR UTC-5)
+# 2. INGESTA DE DATOS (CON BALANCEO UTC-5 ECUADOR)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False) 
 def get_binance_data(symbol, interval, dias_visuales):
@@ -155,7 +150,7 @@ def get_binance_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO
+# 3. MOTOR CUANTITATIVO (PROCESAMIENTO DE SEÑALES)
 # ==========================================
 def calcular_estrategia(df, angulo_requerido, sl_mult):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
@@ -239,7 +234,7 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 4. RENDERIZADO VISUAL Y EJECUCIÓN DE TOASTS
+# 4. RENDERIZADO VISUAL & GESTIÓN DE TOASTS
 # ==========================================
 df_raw = get_binance_data(st.session_state["config"]["symbol"], st.session_state["config"]["tf"], st.session_state["config"]["dias"])
 
@@ -254,24 +249,20 @@ if not df_raw.empty:
         hist["time"] = ultimo_tiempo_vela
         hist["reg"], hist["mb"], hist["ms"] = False, False, False
 
-    # -----------------------------------------------------------------
-    # MÓDULO DE EMISIÓN (TOAST + AUDIO DINÁMICO)
-    # -----------------------------------------------------------------
     if cfg_alertas["regimen"] and df_full['Regime_Start'].iloc[-1] and not hist["reg"]:
-        st.toast(f"**{ticker_activo}**: Cambio detectado a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
+        st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
         reproducir_alerta_local("alerta_regimen.ogg")
         hist["reg"] = True
         
     if cfg_alertas["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
-        st.toast(f"**{ticker_activo}**: Cruce ALCISTA fuerte sobre MediaBuy", icon="🟢")
+        st.toast(f"**{ticker_activo}**: Cruce ALCISTA sobre MediaBuy", icon="🟢")
         reproducir_alerta_local("alerta_alcista.ogg")
         hist["mb"] = True
         
     if cfg_alertas["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
-        st.toast(f"**{ticker_activo}**: Cruce BAJISTA severo bajo MediaSell", icon="🔴")
+        st.toast(f"**{ticker_activo}**: Cruce BAJISTA bajo MediaSell", icon="🔴")
         reproducir_alerta_local("alerta_bajista.ogg")
         hist["ms"] = True
-    # -----------------------------------------------------------------
 
     fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=st.session_state["config"]["dias"])
     df = df_full[df_full.index >= fecha_corte].copy()
@@ -342,9 +333,5 @@ if not df_raw.empty:
         if nuevo_angulo != st.session_state["config"]["angulo"]:
             st.session_state["config"]["angulo"] = nuevo_angulo
             st.rerun()
-
 else:
-    if verificar_error("API_BINANCE"):
-        st.error("🚨 Ejecución detenida por protección algorítmica. Revisa problemas de red o bloqueos de IP.")
-    else:
-        st.error("Error crítico de ingesta: No se pudieron sincronizar los datos de la API de Binance.")
+    st.error("Error crítico de ingesta: No se pudieron sincronizar los datos de la API de Binance.")
