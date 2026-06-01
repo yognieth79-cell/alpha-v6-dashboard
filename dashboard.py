@@ -135,14 +135,12 @@ with st.sidebar.expander(f"🔔 Alertas: {crypto_seleccionada}", expanded=True):
 ticker_activo = symbol_actual.replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE SEÑAL (ARQUITECTURA AUTO-SANABLE V2)
+# 2. INGESTA DE SEÑAL (ARQUITECTURA AUTO-SANABLE V3)
 # ==========================================
-@st.cache_data(ttl=300, show_spinner=False)
-def get_market_data(symbol, interval, dias_visuales):
-    # 1. Validación Pre-Ejecución (Protocolo de Memoria)
-    if verificar_error("BLOQUEO_CATASTROFICO"): 
-        return pd.DataFrame()
 
+# 2.A WORKER PURO: Solo extrae datos, no muta la memoria de Streamlit
+@st.cache_data(ttl=300, show_spinner=False)
+def _worker_fetch_data(symbol, interval, dias_visuales):
     buffer_dias = {"15m": 3, "1h": 10, "4h": 40, "1d": 250}.get(interval, 5)
     dias_totales = dias_visuales + buffer_dias
     now = datetime.utcnow()
@@ -150,32 +148,26 @@ def get_market_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
-    # Función interna para adaptar los parámetros según el exchange
     def adaptar_intervalo(motor, intv):
         if motor == "MEXC_OFFSHORE":
-            mapeo_mexc = {"15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d"}
-            return mapeo_mexc.get(intv, intv)
+            return {"15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d"}.get(intv, intv)
         return intv
 
     motores = [
         ("BINANCE_GLOBAL", "api.binance.com"),
+        ("BINANCE_US", "api.binance.us"),
         ("BINANCE_VISION", "data-api.binance.vision"),
-        ("BINANCE_US", "api.binance.us"), # Añadido bypass para servidores en EE.UU.
         ("MEXC_OFFSHORE", "api.mexc.com")
     ]
     
-    # 2. Configuración de Sesión Institucional
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 QuantAlpha Institutional V6'})
-    
-    # Backoff más compasivo para evitar baneos IP
-    retries = Retry(total=5, backoff_factor=1.5, status_forcelist=[418, 429, 500, 502, 503, 504])
+    session.headers.update({'User-Agent': 'Mozilla/5.0 QuantAlpha Institutional'})
+    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[418, 429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
 
     df_list = []
-    log_fallos = [] # Almacena el motivo exacto del fallo de cada motor
+    log_fallos = []
     
-    # 3. Pipeline de Descarga Resiliente
     for nombre_motor, dominio in motores:
         df_list_temp = []
         temp_start = current_start
@@ -185,52 +177,61 @@ def get_market_data(symbol, interval, dias_visuales):
         while temp_start < end_time_ms:
             url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={intervalo_adaptado}&limit=1000&startTime={temp_start}"
             try:
-                response = session.get(url, timeout=15)
+                response = session.get(url, timeout=10)
                 response.raise_for_status() 
                 data = response.json()
                 
                 if not data or len(data) == 0: 
+                    # Si no hay datos pero no hay error HTTP, el activo no tiene historial suficiente
                     break 
                     
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
                 df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
                 
                 temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
-                
-                # Pausa algorítmica: 0.3s es el mínimo seguro para Binance sin cuenta Pro
-                time.sleep(0.3) 
+                time.sleep(0.3) # Límite dinámico para evitar IP Ban
                 
             except requests.exceptions.HTTPError as e:
-                # Captura el código de error exacto (ej. 451 Geoblock, 429 Rate Limit)
-                codigo = e.response.status_code if e.response is not None else "Desconocido"
-                log_fallos.append(f"{nombre_motor} falló: HTTP {codigo}")
+                codigo = e.response.status_code if e.response is not None else "HTTP_ERR"
+                log_fallos.append(f"{nombre_motor} falló: Código {codigo}")
                 exito_motor = False
                 break
             except requests.exceptions.RequestException as e:
-                log_fallos.append(f"{nombre_motor} falló: Timeout/Red")
+                log_fallos.append(f"{nombre_motor} falló: Timeout/DNS")
                 exito_motor = False
                 break
                 
         if exito_motor and df_list_temp:
             df_list = df_list_temp
-            # Si un motor tiene éxito, limpiamos posibles errores previos en esta sesión
-            st.session_state["errores"] = [err for err in st.session_state["errores"] if err["tipo"] != "BLOQUEO_CATASTROFICO"]
+            log_fallos = [] # Motor exitoso purga el historial de fallos
             break 
             
-    # 4. Gestión de Cierre y Errores Críticos
-    if not df_list: 
-        detalle_error = " | ".join(log_fallos) if log_fallos else "Corte total de red."
-        registrar_error("BLOQUEO_CATASTROFICO", f"APIs inaccesibles. Detalle: {detalle_error}")
-        st.cache_data.clear()
-        return pd.DataFrame()
-    
-    # Procesamiento Vectorizado Final
+    # Retornamos la data pura y los strings de error si los hay
+    if not df_list:
+        motivo = " | ".join(log_fallos) if log_fallos else f"Ningún motor devolvió datos históricos para {symbol}."
+        return pd.DataFrame(), motivo
+
     df = pd.concat(df_list, ignore_index=True)
     df.drop_duplicates(subset=['Open_time'], inplace=True)
     df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
     df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5)
     df.set_index('Date', inplace=True)
     
+    return df, None
+
+# 2.B GESTOR DE ESTADO: Muta st.session_state (No debe ser cacheado)
+def get_market_data(symbol, interval, dias_visuales):
+    if verificar_error("BLOQUEO_CATASTROFICO"): 
+        return pd.DataFrame()
+
+    # Invocamos al worker
+    df, error_msg = _worker_fetch_data(symbol, interval, dias_visuales)
+    
+    if error_msg:
+        registrar_error("BLOQUEO_CATASTROFICO", error_msg)
+        _worker_fetch_data.clear() # Limpiamos la caché inmediatamente al detectar el fallo
+        return pd.DataFrame()
+        
     return df
 
 # ==========================================
