@@ -235,7 +235,11 @@ def calcular_estrategia(df, grosor_nube):
     escapo_nube = False
     
     for i in range(1, len(df)):
-        if not in_trade and df['Signal'].iloc[i] == 1:
+        
+        # 1. ENTRADA PURA POR CRUCE: Solo entra si rompe la MediaBuy de ABAJO hacia ARRIBA
+        cruce_alcista = (df['Close'].iloc[i] > df['MediaBuy'].iloc[i]) and (df['Close'].iloc[i-1] <= df['MediaBuy'].iloc[i-1])
+        
+        if not in_trade and cruce_alcista:
             in_trade = True
             entry_p = df['Close'].iloc[i]
             entry_t = df.index[i]
