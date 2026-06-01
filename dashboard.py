@@ -10,10 +10,6 @@ import warnings
 from datetime import datetime, timedelta
 import os
 from streamlit_autorefresh import st_autorefresh
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import time
 
 warnings.filterwarnings("ignore")
 
@@ -25,9 +21,9 @@ st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
 def generar_estructura_base_activo():
     return {
-        "tf": "1d",           
-        "dias": 90,           
-        "grosor_nube": 0.60,  
+        "tf": "1d",           # Temporalidad por defecto: 1 Día
+        "dias": 90,           # Historial por defecto: 90 Días (3 Meses)
+        "grosor_nube": 0.60,  # Grosor de Nube por defecto: 0.60 ATR
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 
@@ -73,7 +69,7 @@ def reproducir_alerta_local(nombre_archivo):
             pass 
 
 # ==========================================
-# 1. UI: BARRA LATERAL 
+# 1. UI: BARRA LATERAL (CONFIGURACIÓN)
 # ==========================================
 st.sidebar.header("🚀 Parámetros Modo Pro")
 
@@ -135,120 +131,66 @@ with st.sidebar.expander(f"🔔 Alertas: {crypto_seleccionada}", expanded=True):
 ticker_activo = symbol_actual.replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE SEÑAL (ARQUITECTURA AUTO-SANABLE V3)
+# 2. INGESTA DE SEÑAL
 # ==========================================
+@st.cache_data(ttl=50, show_spinner=False)
+def get_market_data(symbol, interval, dias_visuales):
+    if verificar_error("BLOQUEO_CATASTROFICO"): return pd.DataFrame()
 
-# 2.A WORKER PURO: Solo extrae datos, no muta la memoria de Streamlit
-@st.cache_data(ttl=300, show_spinner=False)
-def _worker_fetch_data(symbol, interval, dias_visuales):
     buffer_dias = {"15m": 3, "1h": 10, "4h": 40, "1d": 250}.get(interval, 5)
     dias_totales = dias_visuales + buffer_dias
     now = datetime.utcnow()
     start_date = now - timedelta(days=dias_totales)
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
-    
-    def adaptar_intervalo(motor, intv):
-        if motor == "MEXC_OFFSHORE":
-            return {"15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d"}.get(intv, intv)
-        return intv
-
     motores = [
+        ("BINANCE_VISION", "data-api.binance.vision"), 
         ("BINANCE_GLOBAL", "api.binance.com"),
-        ("BINANCE_US", "api.binance.us"),
-        ("BINANCE_VISION", "data-api.binance.vision"),
         ("MEXC_OFFSHORE", "api.mexc.com")
     ]
-    
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 QuantAlpha Institutional'})
-    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[418, 429, 500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-
     df_list = []
-    log_fallos = []
     
     for nombre_motor, dominio in motores:
-        df_list_temp = []
-        temp_start = current_start
-        exito_motor = True
-        intervalo_adaptado = adaptar_intervalo(nombre_motor, interval)
-        
+        df_list_temp, temp_start, exito_motor = [], current_start, True
         while temp_start < end_time_ms:
-            # MEXC rechaza 1000 velas si el historial es muy viejo; 500 es el estándar seguro
-            limite = 500 if nombre_motor == "MEXC_OFFSHORE" else 1000
-            
-            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={intervalo_adaptado}&limit={limite}&startTime={temp_start}"
-            
-                response = session.get(url, timeout=10)
-                response.raise_for_status() 
-                data = response.json()
-                
-                if not data or len(data) == 0: 
-                    # Si no hay datos pero no hay error HTTP, el activo no tiene historial suficiente
-                    break 
-                    
+            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={temp_start}"
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 QuantAlpha'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                if not data: break
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
                 df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
-                
                 temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
-                time.sleep(0.3) # Límite dinámico para evitar IP Ban
-                
-            except requests.exceptions.HTTPError as e:
-                codigo = e.response.status_code if e.response is not None else "HTTP_ERR"
-                log_fallos.append(f"{nombre_motor} falló: Código {codigo}")
-                exito_motor = False
-                break
-            except requests.exceptions.RequestException as e:
-                log_fallos.append(f"{nombre_motor} falló: Timeout/DNS")
-                exito_motor = False
-                break
+            except Exception:
+                exito_motor = False; break
                 
         if exito_motor and df_list_temp:
             df_list = df_list_temp
-            log_fallos = [] # Motor exitoso purga el historial de fallos
-            break 
+            break
             
-    # Retornamos la data pura y los strings de error si los hay
-    if not df_list:
-        motivo = " | ".join(log_fallos) if log_fallos else f"Ningún motor devolvió datos históricos para {symbol}."
-        return pd.DataFrame(), motivo
-
+    if not df_list: 
+        registrar_error("BLOQUEO_CATASTROFICO", "Conexión rejected.")
+        st.cache_data.clear()
+        return pd.DataFrame()
+    
     df = pd.concat(df_list, ignore_index=True)
     df.drop_duplicates(subset=['Open_time'], inplace=True)
     df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric)
     df['Date'] = pd.to_datetime(df['Open_time'], unit='ms') - pd.Timedelta(hours=5)
     df.set_index('Date', inplace=True)
-    
-    return df, None
-
-# 2.B GESTOR DE ESTADO: Muta st.session_state (No debe ser cacheado)
-def get_market_data(symbol, interval, dias_visuales):
-    if verificar_error("BLOQUEO_CATASTROFICO"): 
-        return pd.DataFrame()
-
-    # Invocamos al worker
-    df, error_msg = _worker_fetch_data(symbol, interval, dias_visuales)
-    
-    if error_msg:
-        registrar_error("BLOQUEO_CATASTROFICO", error_msg)
-        _worker_fetch_data.clear() # Limpiamos la caché inmediatamente al detectar el fallo
-        return pd.DataFrame()
-        
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO: ESTRATEGIA DEFINITIVA
+# 3. MOTOR CUANTITATIVO: ESTRATEGIA PURIFICADA NUBE
 # ==========================================
 def calcular_estrategia(df, grosor_nube):
-    # 1. Zonas Institucionales
     df['Trailing_Top'] = df['High'].rolling(200).max()
     df['Trailing_Bottom'] = df['Low'].rolling(200).min()
     rango = df['Trailing_Top'] - df['Trailing_Bottom']
     df['Discount_Limit'] = df['Trailing_Bottom'] + rango * 0.35
     df['Premium_Limit'] = df['Trailing_Top'] - rango * 0.35
 
-    # 2. Medias Dinámicas
     long_mem, short_mem, media_buy, media_sell = [], [], [], []
     for i in range(len(df)):
         c, o = df['Close'].iloc[i], df['Open'].iloc[i]
@@ -262,10 +204,9 @@ def calcular_estrategia(df, grosor_nube):
         media_buy.append(np.mean(long_mem) if long_mem else np.nan)
         media_sell.append(np.mean(short_mem) if short_mem else np.nan)
         
-    df['MediaBuy'] = media_buy
-    df['MediaSell'] = media_sell
+    df['MediaBuy'], df['MediaSell'] = media_buy, media_sell
 
-    # 3. Clustering K-Means
+    # Clustering K-Means
     df['Returns'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol'] = df['Returns'].rolling(96).std()
     df['Mom'] = df['Close'].pct_change(96)
@@ -281,40 +222,42 @@ def calcular_estrategia(df, grosor_nube):
     df['Regime_Start'] = df['Regime'] != df['Regime'].shift(1)
     df['Regime_End'] = df['Regime'] != df['Regime'].shift(-1)
     
-    # 4. Geometría de Nube y Señales Vectorizadas
+    # Construcción Geométrica de la Nube Verde
     df['ATR'] = df['High'].rolling(14).max() - df['Low'].rolling(14).min()
     df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * grosor_nube)
     
-    # Pre-cálculo estricto de cruces para evitar errores en bucle
+    # 1. ENTRADA PURA Y MECÁNICA: Cruce hacia arriba sin importar el color de la vela
     df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
-    df['Cruce_MS_Bajista'] = (df['Close'] < df['MediaSell']) & (df['Close'].shift(1) >= df['MediaSell'].shift(1))
+    df['Signal'] = np.where(df['Cruce_MB_Up'], 1, -1)
     
-    # 5. MÁQUINA DE ESTADOS FINITOS (MOTOR DE ÓRDENES)
     trades = []
     in_trade = False
     escapo_nube = False
     
     for i in range(1, len(df)):
         
-        # FASE A: ENTRADA PURA
-        if not in_trade and df['Cruce_MB_Up'].iloc[i]:
+        # 1. ENTRADA PURA POR CRUCE: Solo entra si rompe la MediaBuy de ABAJO hacia ARRIBA
+        cruce_alcista = (df['Close'].iloc[i] > df['MediaBuy'].iloc[i]) and (df['Close'].iloc[i-1] <= df['MediaBuy'].iloc[i-1])
+        
+        if not in_trade and cruce_alcista:
             in_trade = True
             entry_p = df['Close'].iloc[i]
             entry_t = df.index[i]
             escapo_nube = False
-            continue  # Salta a la siguiente vela (Previene cierres inmediatos absurdos)
             
-        # FASE B: GESTIÓN DE SALIDA
         elif in_trade:
-            # Condiciones de Evaluación
+            # 1. EVALUAR TAKE PROFIT (Evalúa si ya había escapado en velas anteriores y ahora regresa)
             hit_tp = escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i])
+            
+            # 2. EVALUAR STOP LOSS (Cruce limpio hacia abajo)
             hit_sl = df['Close'].iloc[i] < df['MediaBuy'].iloc[i]
             
-            # Actualización de Estado (Sensibilidad de Escape al Cierre)
+            # 3. ACTUALIZAR ESTADO DE "ESCAPE" (Para las siguientes velas)
+            # Usamos 'Close' para que el algoritmo coincida perfectamente con la línea de tu gráfico
             if df['Close'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
                 escapo_nube = True
             
-            # Ejecución Mecánica
+            # 4. EJECUCIÓN CON PRIORIDAD GEOMÉTRICA
             if hit_tp:
                 exit_p = df['MediaBuy_Tolerancia'].iloc[i] 
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'TP'})
@@ -349,16 +292,12 @@ if not df_raw.empty:
     if cfg_activo["alertas"]["cruce_mb"] and df_full['Cruce_MB_Up'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Entrada Pro (Cruce Arriba)", icon="🟢")
         reproducir_alerta_local("alerta_alcista.mp3"); hist["mb"] = True
-        
-    if cfg_activo["alertas"]["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
-        st.toast(f"**{ticker_activo}**: Alerta - Cruce Bajista MS", icon="🔴")
-        reproducir_alerta_local("alerta_bajista.mp3"); hist["ms"] = True
 
     fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=cfg_activo["dias"])
     df = df_full[df_full.index >= fecha_corte].copy()
     trades_df = trades_df_full[trades_df_full['Entry_Time'] >= fecha_corte].copy() if not trades_df_full.empty else pd.DataFrame()
 
-    last_time, last_price = df.index[-1], df['Close'].iloc[-1]
+    last_time, last_price, last_mb, last_ms = df.index[-1], df['Close'].iloc[-1], df['MediaBuy'].iloc[-1], df['MediaSell'].iloc[-1]
 
     st.subheader(f"Dashboard Modo Pro - {crypto_seleccionada}")
     
@@ -394,20 +333,22 @@ if not df_raw.empty:
     st.plotly_chart(fig, width='stretch')
 
     # =========================================================
-    # AUDITORÍA INSTITUCIONAL (KPIs)
+    # NUEVO BLOQUE: SISTEMA DE AUDITORÍA (ESTILO TRADINGVIEW)
     # =========================================================
     st.markdown("---")
     st.subheader("📋 Tester de Estrategia: Informe de Rendimiento")
     
     if not trades_df.empty:
-        capital_simulacion = 1000.0  
+        capital_simulacion = 1000.0  # Monto fijo asignado por trade solicitado
         
+        # Cálculos matriciales financieros vectorizados
         trades_df['Rendimiento_Pct'] = (trades_df['Exit_Price'] - trades_df['Entry_Price']) / trades_df['Entry_Price']
         trades_df['Resultado_USD'] = capital_simulacion * trades_df['Rendimiento_Pct']
         
         total_operaciones = len(trades_df)
         ops_tp = len(trades_df[trades_df['Type'] == 'TP'])
         ops_sl = len(trades_df[trades_df['Type'] == 'SL'])
+        
         win_rate = (ops_tp / total_operaciones) * 100 if total_operaciones > 0 else 0.0
         
         ganancia_bruta = trades_df[trades_df['Resultado_USD'] > 0]['Resultado_USD'].sum()
@@ -417,6 +358,7 @@ if not df_raw.empty:
         
         profit_factor = ganancia_bruta / abs(perdida_bruta) if perdida_bruta != 0 else np.inf
         
+        # Renderizado de Tarjetas de Auditoría
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("💰 Beneficio Neto", f"${beneficio_neto:,.2f} USD", delta=f"{roi_estrategia:+.2f}% ROI")
         c2.metric("🎯 % de Take Profit", f"{win_rate:.2f}%", delta=f"{ops_tp} Ganadas")
@@ -426,6 +368,7 @@ if not df_raw.empty:
         
         st.markdown("<br>", unsafe_allow_html=True)
         
+        # Estructura de pestañas idéntica a TradingView
         tab_resumen, tab_registro = st.tabs(["📊 Resumen del Rendimiento", "📜 Lista de Operaciones"])
         
         with tab_resumen:
@@ -443,7 +386,7 @@ if not df_raw.empty:
                     f"${capital_simulacion:,.2f} USD",
                     f"${beneficio_neto:,.2f} USD",
                     f"{roi_estrategia:+.2f}%",
-                    f"{profit_factor:.2f}" if profit_factor != np.inf else "Ganancia Pura",
+                    f"{profit_factor:.2f}" if profit_factor != np.inf else "Ganancia Pura (Sin Pérdidas)",
                     f"${trades_df['Resultado_USD'].max():+,.2f} USD",
                     f"${trades_df['Resultado_USD'].min():+,.2f} USD",
                     f"${trades_df['Resultado_USD'].mean():+,.2f} USD"
@@ -451,12 +394,13 @@ if not df_raw.empty:
             }
             st.table(pd.DataFrame(datos_tv))
             
+            # Conclusión automatizada sobre rentabilidad
             if beneficio_neto > 0 and win_rate >= 50:
-                st.success(f"✔️ **Evaluación:** Estrategia **RENTABLE**. Ventaja matemática sólida (Profit Factor: {profit_factor:.2f}).")
+                st.success(f"✔️ **Evaluación Algorítmica:** La estrategia es **RENTABLE** en este periodo. Muestra una ventaja matemática sólida con un Profit Factor de {profit_factor:.2f}.")
             elif beneficio_neto > 0:
-                st.warning(f"⚠️ **Evaluación:** Estrategia **RENTABLE** por rallies masivos. Win Rate bajo ({win_rate:.2f}%).")
+                st.warning(f"⚠️ **Evaluación Algorítmica:** La estrategia es **RENTABLE** pero depende de operaciones extraordinarias (Rallies masivos). El Win Rate es bajo ({win_rate:.2f}%).")
             else:
-                st.error("❌ **Evaluación:** Estrategia **NO RENTABLE** bajo estas condiciones.")
+                st.error("❌ **Evaluación Algorítmica:** La estrategia **NO ES RENTABLE** bajo las condiciones actuales de mercado en este rango. Requiere optimización de filtros o cambio de activo.")
                 
         with tab_registro:
             df_registro = trades_df.copy()
@@ -467,6 +411,7 @@ if not df_raw.empty:
             df_registro['Variación'] = (df_registro['Rendimiento_Pct'] * 100).map('{:+.2f}%'.format)
             df_registro['PnL USD'] = df_registro['Resultado_USD'].map('${:+,.2f} USD'.format)
             
+            # Cambiamos nombres para presentación formal
             df_registro.rename(columns={'Type': 'Tipo Cierre'}, inplace=True)
             
             st.dataframe(
@@ -475,21 +420,7 @@ if not df_raw.empty:
                 height=250
             )
     else:
-        st.info("ℹ️ No se registran operaciones cerradas en la ventana de tiempo seleccionada.")
+        st.info("ℹ️ No se registran operaciones cerradas en la ventana de tiempo seleccionada para auditar.")
 
 else:
-    st.error("🚨 Ejecución detenida por protección algorítmica. No se pudieron descargar los datos.")
-    
-    if len(st.session_state["errores"]) > 0:
-        with st.expander("🔍 Ver Detalles Técnicos del Bloqueo", expanded=True):
-            for err in st.session_state["errores"]: 
-                st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
-                
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # Botón de escape para reiniciar el caché y volver a intentar
-    if st.button("🔄 Forzar Re-conexión de Motores"):
-        st.session_state["errores"] = []
-        # La corrección clave: apuntar al worker cacheado, no al gestor
-        _worker_fetch_data.clear() 
-        st.rerun()
+    st.error("🚨 Ejecución detenida por protección algorítmica.")
