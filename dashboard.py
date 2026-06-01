@@ -138,8 +138,11 @@ def get_market_data(symbol, interval, dias_visuales):
     start_date = now - timedelta(days=dias_totales)
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
-    
-    motores = [("BINANCE_GLOBAL", "api.binance.com"), ("BINANCE_US", "api.binance.us"), ("MEXC_OFFSHORE", "api.mexc.com")]
+    motores = [
+        ("BINANCE_VISION", "data-api.binance.vision"), # Espejo oficial sin geobloqueo
+        ("BINANCE_GLOBAL", "api.binance.com"),
+        ("MEXC_OFFSHORE", "api.mexc.com")
+    ]
     df_list = []
     
     for nombre_motor, dominio in motores:
