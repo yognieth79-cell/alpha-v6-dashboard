@@ -484,8 +484,9 @@ else:
                 
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # Botón de escape para reiniciar el caché y volver a intentar
+# Botón de escape para reiniciar el caché y volver a intentar
     if st.button("🔄 Forzar Re-conexión de Motores"):
         st.session_state["errores"] = []
-        get_market_data.clear() 
+        # CORRECCIÓN: Llamamos a .clear() en el worker cacheado, no en el gestor
+        _worker_fetch_data.clear() 
         st.rerun()
