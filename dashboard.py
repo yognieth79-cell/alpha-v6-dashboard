@@ -422,4 +422,17 @@ if not df_raw.empty:
         st.info("ℹ️ No se registran operaciones cerradas en la ventana de tiempo seleccionada.")
 
 else:
-    st.error("🚨 Ejecución detenida por protección algorítmica.")
+    st.error("🚨 Ejecución detenida por protección algorítmica. No se pudieron descargar los datos.")
+    
+    if len(st.session_state["errores"]) > 0:
+        with st.expander("🔍 Ver Detalles Técnicos del Bloqueo", expanded=True):
+            for err in st.session_state["errores"]: 
+                st.code(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
+                
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Botón de escape para reiniciar el caché y volver a intentar
+    if st.button("🔄 Forzar Re-conexión de Motores"):
+        st.session_state["errores"] = []
+        get_market_data.clear() 
+        st.rerun()
