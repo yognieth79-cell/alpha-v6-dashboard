@@ -21,7 +21,7 @@ st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
 def generar_estructura_base_activo():
     return {
-        "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 0.5, # Ajustado a 0.5 por defecto para la nube
+        "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 1.5, # Restaurado a 1.5 original
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 
@@ -67,9 +67,9 @@ def reproducir_alerta_local(nombre_archivo):
             pass 
 
 # ==========================================
-# 1. UI: BARRA LATERAL (MODO PRO)
+# 1. UI: BARRA LATERAL 
 # ==========================================
-st.sidebar.header("🚀 Modo Pro: Auditoría")
+st.sidebar.header("⚙️ Parámetros de Auditoría")
 
 top_20_cryptos = {
     "Bitcoin (BTC)": "BTCUSDT", "Ethereum (ETH)": "ETHUSDT", "Binance Coin (BNB)": "BNBUSDT",
@@ -107,8 +107,7 @@ if cfg_activo["dias"] != opciones_dias[dias_seleccionados]:
     cfg_activo["dias"] = opciones_dias[dias_seleccionados]
     guardar_settings_globales()
 
-# Este slider ahora controla qué tan "gruesa" es la nube verde
-sl_val = st.sidebar.slider("Grosor Nube Verde (Filtro ATR)", 0.1, 2.0, cfg_activo["sl_mult"], 0.1)
+sl_val = st.sidebar.slider("Multiplicador ATR (Grosor Nube)", 0.5, 3.0, cfg_activo["sl_mult"], 0.1)
 if cfg_activo["sl_mult"] != sl_val:
     cfg_activo["sl_mult"] = sl_val
     guardar_settings_globales()
@@ -139,6 +138,7 @@ def get_market_data(symbol, interval, dias_visuales):
     start_date = now - timedelta(days=dias_totales)
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
+    
     motores = [
         ("BINANCE_VISION", "data-api.binance.vision"), 
         ("BINANCE_GLOBAL", "api.binance.com"),
@@ -178,9 +178,10 @@ def get_market_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO: MODO PRO (REVERSIÓN A LA MEDIA)
+# 3. MOTOR CUANTITATIVO (ESTRATEGIA NUBE / MODO PRO)
 # ==========================================
-def calcular_estrategia(df, angulo_requerido, grosor_nube_atr):
+def calcular_estrategia(df, angulo_requerido, sl_mult):
+    # --- CÁLCULOS MATEMÁTICOS BASE (INTACTOS) ---
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
     weights /= np.sum(weights)
     df['yhat1'] = df['Close'].rolling(25).apply(lambda x: np.dot(x, weights), raw=True)
@@ -208,7 +209,6 @@ def calcular_estrategia(df, angulo_requerido, grosor_nube_atr):
         
     df['MediaBuy'], df['MediaSell'] = media_buy, media_sell
 
-    # Clustering de Regímenes
     df['Returns'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol'] = df['Returns'].rolling(96).std()
     df['Mom'] = df['Close'].pct_change(96)
@@ -223,18 +223,18 @@ def calcular_estrategia(df, angulo_requerido, grosor_nube_atr):
 
     df['Regime_Start'] = df['Regime'] != df['Regime'].shift(1)
     df['Regime_End'] = df['Regime'] != df['Regime'].shift(-1)
+
+    # Lógica de Construcción de Nube Verde
+    df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * sl_mult)
     
-    # ---------------------------------------------------------
-    # LÓGICA MODO PRO: Nube Verde y Reversión a la Media
-    # ---------------------------------------------------------
-    # El grosor de la nube es dictado por el slider de la UI
-    df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * grosor_nube_atr)
+    # ----------------------------------------------------
+    # NUEVA LÓGICA DE DECISIÓN (EXACTAMENTE COMO SOLICITASTE)
+    # ----------------------------------------------------
     
-    # ENTRADA: Cruce hacia arriba de la MediaBuy (de abajo hacia arriba)
+    # ENTRADA: Cruce hacia arriba de la MediaBuy
     df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
     vela_verde = df['Close'] > df['Open']
     
-    # Validamos el cruce con el ángulo cinético
     df['Buy_Trigger'] = df['Cruce_MB_Up'] & vela_verde & (df['Angle'] >= angulo_requerido)
     df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
     
@@ -243,27 +243,35 @@ def calcular_estrategia(df, angulo_requerido, grosor_nube_atr):
     escapo_nube = False
     
     for i in range(1, len(df)):
+        # Check para ENTRADA
         if not in_trade and df['Signal'].iloc[i] == 1:
             in_trade = True
             entry_p = df['Close'].iloc[i]
             entry_t = df.index[i]
-            escapo_nube = False # Reseteamos el estado de escape
+            escapo_nube = False # Se reinicia el flag al comprar
             
         elif in_trade:
-            # 1. Monitoreo de Zona de Expansión (El precio sale de la nube por arriba)
+            # 1. Verificar si el precio sale de la nube por la parte superior
             if df['Low'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
                 escapo_nube = True
                 
-            # 2. STOP LOSS ESTRICTO: Cruce de la MediaBuy hacia abajo
-            if df['Close'].iloc[i] < df['MediaBuy'].iloc[i]:
+            # 2. TAKE PROFIT: Si ya escapó de la nube, y ahora el Low la toca/cruza de vuelta
+            hit_tp = escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i])
+            
+            # 3. STOP LOSS: Cruce hacia abajo de la MediaBuy
+            hit_sl = df['Close'].iloc[i] < df['MediaBuy'].iloc[i]
+            
+            # EJECUCIÓN (Prioridad al SL para proteger el capital)
+            if hit_sl:
                 exit_p = df['Close'].iloc[i]
+                # Si a pesar de ser SL, ganaste dinero (porque la MediaBuy subió), se anota como TP
                 tipo_salida = 'TP' if exit_p > entry_p else 'SL'
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': tipo_salida})
                 in_trade = False
                 
-            # 3. TAKE PROFIT (Reversión): Toca la nube verde tras haber escapado
-            elif escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i]):
-                exit_p = df['MediaBuy_Tolerancia'].iloc[i] # Ejecuta venta al tocar la frontera de la nube
+            elif hit_tp:
+                # Se vende en la frontera de la nube (donde la tocó)
+                exit_p = df['MediaBuy_Tolerancia'].iloc[i] 
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'TP'})
                 in_trade = False
 
@@ -288,7 +296,6 @@ if not df_raw.empty:
         st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
         reproducir_alerta_local("alerta_regimen.mp3"); hist["reg"] = True
         
-    # Cruce alcista actualizado a la nueva lógica
     if cfg_activo["alertas"]["cruce_mb"] and df_full['Cruce_MB_Up'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Cruce ALCISTA", icon="🟢")
         reproducir_alerta_local("alerta_alcista.mp3"); hist["mb"] = True
@@ -299,7 +306,7 @@ if not df_raw.empty:
 
     last_time, last_price, last_mb, last_ms = df.index[-1], df['Close'].iloc[-1], df['MediaBuy'].iloc[-1], df['MediaSell'].iloc[-1]
 
-    st.subheader(f"Dashboard Modo Pro - {crypto_seleccionada}")
+    st.subheader(f"Dashboard Institucional - {crypto_seleccionada}")
     
     if len(st.session_state["errores"]) > 0:
         with st.expander("🔍 Auditoría de Red", expanded=False):
@@ -309,11 +316,11 @@ if not df_raw.empty:
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name=ticker_activo, line=dict(color='gray', width=1)))
     
-    # Nube Verde:
+    # Dibujado de la Nube (Zona de Absorción)
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy_Tolerancia'], name='Frontera Nube', line=dict(color='rgba(0,230,118,0.2)', width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy'], name='MediaBuy', fill='tonexty', fillcolor='rgba(0,230,118,0.1)', line=dict(color='#00e676', width=2)))
     
-    # MediaSell Mantenida por contexto visual
+    # (Opcional) Si quieres quitar la línea roja del gráfico, borra la siguiente línea:
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaSell'], name='MediaSell', line=dict(color='#ff5252', width=2)))
     
     fig.add_annotation(x=last_time, y=last_price, text=f"<b>{last_price:.2f}</b>", showarrow=True, arrowhead=0, ax=40, ay=0, bgcolor="gray", font=dict(color="white", size=11), xanchor="left")
@@ -328,9 +335,9 @@ if not df_raw.empty:
 
     if not trades_df.empty:
         tp_df, sl_df = trades_df[trades_df['Type'] == 'TP'], trades_df[trades_df['Type'] == 'SL']
-        fig.add_trace(go.Scatter(x=trades_df['Entry_Time'], y=trades_df['Entry_Price'] * 0.995, mode='markers', name='Entrada (Cruce Arriba)', marker=dict(symbol='triangle-up', color='#00ff00', size=14)))
-        fig.add_trace(go.Scatter(x=tp_df['Exit_Time'] if not tp_df.empty else [None], y=tp_df['Exit_Price'] if not tp_df.empty else [None], mode='markers', name='Take Profit (Retorno a Nube)', marker=dict(symbol='star', color='orange', size=10)))
-        fig.add_trace(go.Scatter(x=sl_df['Exit_Time'] if not sl_df.empty else [None], y=sl_df['Exit_Price'] if not sl_df.empty else [None], mode='markers', name='Stop Loss (Cruce Abajo)', marker=dict(symbol='x', color='red', size=10)))
+        fig.add_trace(go.Scatter(x=trades_df['Entry_Time'], y=trades_df['Entry_Price'] * 0.995, mode='markers', name='Entrada A+', marker=dict(symbol='triangle-up', color='#00ff00', size=14)))
+        fig.add_trace(go.Scatter(x=tp_df['Exit_Time'] if not tp_df.empty else [None], y=tp_df['Exit_Price'] if not tp_df.empty else [None], mode='markers', name='Take Profit', marker=dict(symbol='star', color='orange', size=10)))
+        fig.add_trace(go.Scatter(x=sl_df['Exit_Time'] if not sl_df.empty else [None], y=sl_df['Exit_Price'] if not sl_df.empty else [None], mode='markers', name='Stop Loss', marker=dict(symbol='x', color='red', size=10)))
 
     fig.update_layout(template='plotly_dark', height=500, margin=dict(r=60), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, width='stretch')
