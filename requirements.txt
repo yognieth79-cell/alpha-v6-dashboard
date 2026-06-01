@@ -4,7 +4,4 @@ numpy
 scikit-learn
 plotly
 streamlit-autorefresh
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import time
+
