@@ -21,7 +21,7 @@ st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
 def generar_estructura_base_activo():
     return {
-        "tf": "15m", "dias": 1, "grosor_nube": 0.6, # Adaptado al 0.6 de tu imagen
+        "tf": "1d", "dias": 90, "grosor_nube": 0.6, # Adaptado al 0.6 de tu imagen
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 
