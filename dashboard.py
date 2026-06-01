@@ -243,17 +243,23 @@ def calcular_estrategia(df, grosor_nube):
             escapo_nube = False
             
         elif in_trade:
-            if df['Low'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
-                escapo_nube = True
-                
+            # 1. EVALUAR TAKE PROFIT (Evalúa si ya había escapado en velas anteriores y ahora regresa)
             hit_tp = escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i])
+            
+            # 2. EVALUAR STOP LOSS (Cruce limpio hacia abajo)
             hit_sl = df['Close'].iloc[i] < df['MediaBuy'].iloc[i]
             
-            # Prioridad Geométrica Absoluta
+            # 3. ACTUALIZAR ESTADO DE "ESCAPE" (Para las siguientes velas)
+            # Usamos 'Close' para que el algoritmo coincida perfectamente con la línea de tu gráfico
+            if df['Close'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
+                escapo_nube = True
+            
+            # 4. EJECUCIÓN CON PRIORIDAD GEOMÉTRICA
             if hit_tp:
                 exit_p = df['MediaBuy_Tolerancia'].iloc[i] 
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'TP'})
                 in_trade = False
+                
             elif hit_sl:
                 exit_p = df['Close'].iloc[i]
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'SL'})
