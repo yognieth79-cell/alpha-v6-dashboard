@@ -226,10 +226,9 @@ def calcular_estrategia(df, grosor_nube):
     df['ATR'] = df['High'].rolling(14).max() - df['Low'].rolling(14).min()
     df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * grosor_nube)
     
-    # ENTRADA PURA: Cruce hacia arriba + Vela Verde
+    # 1. ENTRADA PURA Y MECÁNICA: Cruce hacia arriba sin importar el color de la vela
     df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
-    df['Buy_Trigger'] = df['Cruce_MB_Up'] & (df['Close'] > df['Open'])
-    df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
+    df['Signal'] = np.where(df['Cruce_MB_Up'], 1, -1)
     
     trades = []
     in_trade = False
