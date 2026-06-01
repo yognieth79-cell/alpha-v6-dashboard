@@ -135,9 +135,9 @@ with st.sidebar.expander(f"🔔 Alertas: {crypto_seleccionada}", expanded=True):
 ticker_activo = symbol_actual.replace("USDT", "")
 
 # ==========================================
-# 2. INGESTA DE SEÑAL (ARQUITECTURA AUTO-SANABLE)
+# 2. INGESTA DE SEÑAL (ARQUITECTURA AUTO-SANABLE V2)
 # ==========================================
-@st.cache_data(ttl=300, show_spinner=False) # Caché subido a 5 min para evitar baneos
+@st.cache_data(ttl=300, show_spinner=False)
 def get_market_data(symbol, interval, dias_visuales):
     # 1. Validación Pre-Ejecución (Protocolo de Memoria)
     if verificar_error("BLOQUEO_CATASTROFICO"): 
@@ -150,59 +150,77 @@ def get_market_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     
+    # Función interna para adaptar los parámetros según el exchange
+    def adaptar_intervalo(motor, intv):
+        if motor == "MEXC_OFFSHORE":
+            mapeo_mexc = {"15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d"}
+            return mapeo_mexc.get(intv, intv)
+        return intv
+
     motores = [
-        ("BINANCE_VISION", "data-api.binance.vision"), 
         ("BINANCE_GLOBAL", "api.binance.com"),
+        ("BINANCE_VISION", "data-api.binance.vision"),
+        ("BINANCE_US", "api.binance.us"), # Añadido bypass para servidores en EE.UU.
         ("MEXC_OFFSHORE", "api.mexc.com")
     ]
     
-    # 2. Configuración de Sesión con Exponential Backoff
+    # 2. Configuración de Sesión Institucional
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 QuantAlpha Institutional V6'})
     
-    # Estrategia de reintentos: 5 intentos, pausas de 0.5s, 1s, 2s, 4s, 8s ante fallos 429 (Rate Limit) o 50X
-    retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    # Backoff más compasivo para evitar baneos IP
+    retries = Retry(total=5, backoff_factor=1.5, status_forcelist=[418, 429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
 
     df_list = []
+    log_fallos = [] # Almacena el motivo exacto del fallo de cada motor
     
     # 3. Pipeline de Descarga Resiliente
     for nombre_motor, dominio in motores:
         df_list_temp = []
         temp_start = current_start
         exito_motor = True
+        intervalo_adaptado = adaptar_intervalo(nombre_motor, interval)
         
         while temp_start < end_time_ms:
-            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={interval}&limit=1000&startTime={temp_start}"
+            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={intervalo_adaptado}&limit=1000&startTime={temp_start}"
             try:
-                response = session.get(url, timeout=10)
-                response.raise_for_status() # Detona excepción si el código no es 200 OK
+                response = session.get(url, timeout=15)
+                response.raise_for_status() 
                 data = response.json()
                 
-                if not data: 
-                    break # Fin de los datos históricos
+                if not data or len(data) == 0: 
+                    break 
                     
                 df_temp = pd.DataFrame(data, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume', 'Trades', 'Taker_buy_base', 'Taker_buy_quote', 'Ignore'])
                 df_list_temp.append(df_temp[['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume']])
                 
                 temp_start = int(df_temp['Close_time'].iloc[-1]) + 1
                 
-                # Pequeña pausa táctica para no saturar la API en descargas de años de historia
-                time.sleep(0.1) 
+                # Pausa algorítmica: 0.3s es el mínimo seguro para Binance sin cuenta Pro
+                time.sleep(0.3) 
                 
+            except requests.exceptions.HTTPError as e:
+                # Captura el código de error exacto (ej. 451 Geoblock, 429 Rate Limit)
+                codigo = e.response.status_code if e.response is not None else "Desconocido"
+                log_fallos.append(f"{nombre_motor} falló: HTTP {codigo}")
+                exito_motor = False
+                break
             except requests.exceptions.RequestException as e:
-                # Falló el motor actual incluso con Backoff, pasamos al siguiente silenciosamente
+                log_fallos.append(f"{nombre_motor} falló: Timeout/Red")
                 exito_motor = False
                 break
                 
         if exito_motor and df_list_temp:
             df_list = df_list_temp
-            break # Descarga exitosa, salimos del bucle de motores
+            # Si un motor tiene éxito, limpiamos posibles errores previos en esta sesión
+            st.session_state["errores"] = [err for err in st.session_state["errores"] if err["tipo"] != "BLOQUEO_CATASTROFICO"]
+            break 
             
     # 4. Gestión de Cierre y Errores Críticos
     if not df_list: 
-        # Ningún motor pudo responder (Caja de Memoria de Errores)
-        registrar_error("BLOQUEO_CATASTROFICO", "APIs inaccesibles o IP baneada permanentemente.")
+        detalle_error = " | ".join(log_fallos) if log_fallos else "Corte total de red."
+        registrar_error("BLOQUEO_CATASTROFICO", f"APIs inaccesibles. Detalle: {detalle_error}")
         st.cache_data.clear()
         return pd.DataFrame()
     
