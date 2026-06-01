@@ -10,6 +10,10 @@ import warnings
 from datetime import datetime, timedelta
 import os
 from streamlit_autorefresh import st_autorefresh
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import time
 
 warnings.filterwarnings("ignore")
 
