@@ -21,7 +21,7 @@ st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
 def generar_estructura_base_activo():
     return {
-        "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 1.5,
+        "tf": "15m", "dias": 1, "angulo": 15, "sl_mult": 0.5, # Ajustado a 0.5 por defecto para la nube
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 
@@ -67,9 +67,9 @@ def reproducir_alerta_local(nombre_archivo):
             pass 
 
 # ==========================================
-# 1. UI: BARRA LATERAL (CONFIGURACIÓN DE EJECUCIÓN)
+# 1. UI: BARRA LATERAL (MODO PRO)
 # ==========================================
-st.sidebar.header("⚙️ Parámetros de Auditoría")
+st.sidebar.header("🚀 Modo Pro: Auditoría")
 
 top_20_cryptos = {
     "Bitcoin (BTC)": "BTCUSDT", "Ethereum (ETH)": "ETHUSDT", "Binance Coin (BNB)": "BNBUSDT",
@@ -102,12 +102,13 @@ if cfg_activo["tf"] != opciones_tf[tf_seleccionado]:
     guardar_settings_globales()
 
 opciones_dias = {"1 Día": 1, "2 Días": 2, "3 Días": 3, "1 Semana": 7, "1 Mes (30d)": 30, "2 Meses (60d)": 60, "3 Meses (90d)": 90}
-dias_seleccionados = st.sidebar.selectbox("Rango de Historial (Visualización)", list(opciones_dias.keys()), index=list(opciones_dias.values()).index(cfg_activo["dias"]))
+dias_seleccionados = st.sidebar.selectbox("Rango de Historial", list(opciones_dias.keys()), index=list(opciones_dias.values()).index(cfg_activo["dias"]))
 if cfg_activo["dias"] != opciones_dias[dias_seleccionados]:
     cfg_activo["dias"] = opciones_dias[dias_seleccionados]
     guardar_settings_globales()
 
-sl_val = st.sidebar.slider("Multiplicador ATR (Base SL)", 0.5, 3.0, cfg_activo["sl_mult"], 0.1)
+# Este slider ahora controla qué tan "gruesa" es la nube verde
+sl_val = st.sidebar.slider("Grosor Nube Verde (Filtro ATR)", 0.1, 2.0, cfg_activo["sl_mult"], 0.1)
 if cfg_activo["sl_mult"] != sl_val:
     cfg_activo["sl_mult"] = sl_val
     guardar_settings_globales()
@@ -139,7 +140,7 @@ def get_market_data(symbol, interval, dias_visuales):
     current_start = int(start_date.timestamp() * 1000)
     end_time_ms = int(now.timestamp() * 1000)
     motores = [
-        ("BINANCE_VISION", "data-api.binance.vision"), # Espejo oficial sin geobloqueo
+        ("BINANCE_VISION", "data-api.binance.vision"), 
         ("BINANCE_GLOBAL", "api.binance.com"),
         ("MEXC_OFFSHORE", "api.mexc.com")
     ]
@@ -177,9 +178,9 @@ def get_market_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO: TRAILING RATCHET
+# 3. MOTOR CUANTITATIVO: MODO PRO (REVERSIÓN A LA MEDIA)
 # ==========================================
-def calcular_estrategia(df, angulo_requerido, sl_mult):
+def calcular_estrategia(df, angulo_requerido, grosor_nube_atr):
     weights = np.array([(1 + (i**2) / (2 * 8.0 * 8**2)) ** (-8.0) for i in range(25)])[::-1]
     weights /= np.sum(weights)
     df['yhat1'] = df['Close'].rolling(25).apply(lambda x: np.dot(x, weights), raw=True)
@@ -206,9 +207,8 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
         media_sell.append(np.mean(short_mem) if short_mem else np.nan)
         
     df['MediaBuy'], df['MediaSell'] = media_buy, media_sell
-    df['Cruce_MB_Alcista'] = (df['Close'].shift(1) <= df['MediaBuy'].shift(1)) & (df['Close'] > df['MediaBuy'])
-    df['Cruce_MS_Bajista'] = (df['Close'].shift(1) >= df['MediaSell'].shift(1)) & (df['Close'] < df['MediaSell'])
 
+    # Clustering de Regímenes
     df['Returns'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol'] = df['Returns'].rolling(96).std()
     df['Mom'] = df['Close'].pct_change(96)
@@ -223,66 +223,48 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
 
     df['Regime_Start'] = df['Regime'] != df['Regime'].shift(1)
     df['Regime_End'] = df['Regime'] != df['Regime'].shift(-1)
-    df['VolumenPromedio'] = df['Volume'].rolling(20).mean()
-    df['VolumenFuerte'] = df['Volume'] > df['VolumenPromedio']
-    df['SellCondition'] = df['yhat1'] < df['yhat1'].shift(1)
-    df['CruceDetectado'] = (df['Close'] < df['MediaSell']) & (df['Close'].shift(1) >= df['MediaSell'].shift(1))
     
-    df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * 0.5)
-    df['En_Zona_Soporte'] = df['Low'] <= df['MediaBuy_Tolerancia']
-    df['Memoria_Toque'] = df['En_Zona_Soporte'].rolling(window=5).max() == 1
+    # ---------------------------------------------------------
+    # LÓGICA MODO PRO: Nube Verde y Reversión a la Media
+    # ---------------------------------------------------------
+    # El grosor de la nube es dictado por el slider de la UI
+    df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * grosor_nube_atr)
     
+    # ENTRADA: Cruce hacia arriba de la MediaBuy (de abajo hacia arriba)
+    df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
     vela_verde = df['Close'] > df['Open']
-    df['Buy_Trigger'] = df['Memoria_Toque'] & vela_verde & (df['Close'] > df['MediaBuy']) & (df['yhat1'] > df['yhat1'].shift(1)) & (df['Angle'] >= angulo_requerido)
+    
+    # Validamos el cruce con el ángulo cinético
+    df['Buy_Trigger'] = df['Cruce_MB_Up'] & vela_verde & (df['Angle'] >= angulo_requerido)
     df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
     
     trades = []
-    in_trade, entry_p, sl_price, cruce_latch = False, 0, 0, False 
-    highest_p = 0.0
+    in_trade = False
+    escapo_nube = False
     
     for i in range(1, len(df)):
-        if df['CruceDetectado'].iloc[i]: cruce_latch = True
-
         if not in_trade and df['Signal'].iloc[i] == 1:
-            in_trade, entry_p, cruce_latch = True, df['Close'].iloc[i], False 
-            highest_p = entry_p 
-            sl_price = entry_p - (df['ATR'].iloc[i] * sl_mult)
+            in_trade = True
+            entry_p = df['Close'].iloc[i]
             entry_t = df.index[i]
+            escapo_nube = False # Reseteamos el estado de escape
             
         elif in_trade:
-            # Rastreamos el pico más alto alcanzado
-            highest_p = max(highest_p, df['High'].iloc[i])
-            
-            # --- NUEVA LÓGICA DE ESCALADA (TRAILING RATCHET 3 FASES) ---
-            distancia_canal = df['MediaSell'].iloc[i] - df['MediaBuy'].iloc[i]
-            mitad_canal = df['MediaBuy'].iloc[i] + (distancia_canal * 0.5)
-            
-            if highest_p >= df['MediaSell'].iloc[i]:
-                # Fase 3: Parabolica (Rompe la resistencia roja) -> Trailing Ultra Ceñido para surfear el mechón
-                nuevo_sl = highest_p - (df['ATR'].iloc[i] * 0.25)
-            elif highest_p >= mitad_canal:
-                # Fase 2: Ganancia Asegurada (Cruza la mitad del canal) -> Trailing Ceñido
-                nuevo_sl = highest_p - (df['ATR'].iloc[i] * 0.8)
-            else:
-                # Fase 1: Despegue -> Trailing Estándar (Basado en el multiplicador del usuario)
-                nuevo_sl = highest_p - (df['ATR'].iloc[i] * sl_mult)
+            # 1. Monitoreo de Zona de Expansión (El precio sale de la nube por arriba)
+            if df['Low'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
+                escapo_nube = True
                 
-            # El Stop Loss se aprieta como un trinquete (nunca retrocede)
-            sl_price = max(sl_price, nuevo_sl)
-
-            # Verificación de colisión (Intra-candle simulation)
-            hit_sl_o_trailing = df['Low'].iloc[i] <= sl_price
-            
-            if hit_sl_o_trailing:
-                exit_p = sl_price
-                # Si el Trailing Stop saca la operación por encima del precio de entrada, es un Take Profit real
+            # 2. STOP LOSS ESTRICTO: Cruce de la MediaBuy hacia abajo
+            if df['Close'].iloc[i] < df['MediaBuy'].iloc[i]:
+                exit_p = df['Close'].iloc[i]
                 tipo_salida = 'TP' if exit_p > entry_p else 'SL'
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': tipo_salida})
                 in_trade = False
                 
-            # Salida alternativa por condición de pérdida de Momentum de volumen o régimen de agotamiento
-            elif (df['SellCondition'].iloc[i] and pd.notna(df['MediaSell'].iloc[i]) and (df['Close'].iloc[i] > mitad_canal) and df['VolumenFuerte'].iloc[i]) or ((df['Regime'].iloc[i] == 1) and (df['High'].iloc[i] >= df['MediaSell'].iloc[i]) and (df['Close'].iloc[i] < df['Close'].iloc[i-1])):
-                trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': df['Close'].iloc[i], 'Type': 'Sell_Logic'})
+            # 3. TAKE PROFIT (Reversión): Toca la nube verde tras haber escapado
+            elif escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i]):
+                exit_p = df['MediaBuy_Tolerancia'].iloc[i] # Ejecuta venta al tocar la frontera de la nube
+                trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'TP'})
                 in_trade = False
 
     return df, pd.DataFrame(trades), kmeans
@@ -306,13 +288,10 @@ if not df_raw.empty:
         st.toast(f"**{ticker_activo}**: Cambio a Régimen {df_full['Regime'].iloc[-1]}", icon="🔄")
         reproducir_alerta_local("alerta_regimen.mp3"); hist["reg"] = True
         
-    if cfg_activo["alertas"]["cruce_mb"] and df_full['Cruce_MB_Alcista'].iloc[-1] and not hist["mb"]:
+    # Cruce alcista actualizado a la nueva lógica
+    if cfg_activo["alertas"]["cruce_mb"] and df_full['Cruce_MB_Up'].iloc[-1] and not hist["mb"]:
         st.toast(f"**{ticker_activo}**: Cruce ALCISTA", icon="🟢")
         reproducir_alerta_local("alerta_alcista.mp3"); hist["mb"] = True
-        
-    if cfg_activo["alertas"]["cruce_ms"] and df_full['Cruce_MS_Bajista'].iloc[-1] and not hist["ms"]:
-        st.toast(f"**{ticker_activo}**: Cruce BAJISTA", icon="🔴")
-        reproducir_alerta_local("alerta_bajista.mp3"); hist["ms"] = True
 
     fecha_corte = (datetime.utcnow() - pd.Timedelta(hours=5)) - timedelta(days=cfg_activo["dias"])
     df = df_full[df_full.index >= fecha_corte].copy()
@@ -320,7 +299,7 @@ if not df_raw.empty:
 
     last_time, last_price, last_mb, last_ms = df.index[-1], df['Close'].iloc[-1], df['MediaBuy'].iloc[-1], df['MediaSell'].iloc[-1]
 
-    st.subheader(f"Dashboard Institucional - {crypto_seleccionada}")
+    st.subheader(f"Dashboard Modo Pro - {crypto_seleccionada}")
     
     if len(st.session_state["errores"]) > 0:
         with st.expander("🔍 Auditoría de Red", expanded=False):
@@ -329,9 +308,14 @@ if not df_raw.empty:
 
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name=ticker_activo, line=dict(color='gray', width=1)))
-    fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy_Tolerancia'], name='Zona Absorc.', line=dict(color='rgba(0,230,118,0.2)', width=0), showlegend=False))
+    
+    # Nube Verde:
+    fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy_Tolerancia'], name='Frontera Nube', line=dict(color='rgba(0,230,118,0.2)', width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy'], name='MediaBuy', fill='tonexty', fillcolor='rgba(0,230,118,0.1)', line=dict(color='#00e676', width=2)))
+    
+    # MediaSell Mantenida por contexto visual
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaSell'], name='MediaSell', line=dict(color='#ff5252', width=2)))
+    
     fig.add_annotation(x=last_time, y=last_price, text=f"<b>{last_price:.2f}</b>", showarrow=True, arrowhead=0, ax=40, ay=0, bgcolor="gray", font=dict(color="white", size=11), xanchor="left")
 
     colores_regimen = ['#00e676', '#2196f3', '#ff9800'] 
@@ -343,11 +327,10 @@ if not df_raw.empty:
         fig.add_trace(go.Scatter(x=df.index[mask_extremos], y=df['Close'][mask_extremos], mode='markers', name=f'Reg {i}', marker=dict(color=colores_regimen[i], size=7, line=dict(width=1, color='white'))))
 
     if not trades_df.empty:
-        tp_df, sl_df, sell_logic_df = trades_df[trades_df['Type'] == 'TP'], trades_df[trades_df['Type'] == 'SL'], trades_df[trades_df['Type'] == 'Sell_Logic']
-        fig.add_trace(go.Scatter(x=trades_df['Entry_Time'], y=trades_df['Entry_Price'] * 0.995, mode='markers', name='Entrada A+', marker=dict(symbol='triangle-up', color='#00ff00', size=14)))
-        fig.add_trace(go.Scatter(x=tp_df['Exit_Time'] if not tp_df.empty else [None], y=tp_df['Exit_Price'] if not tp_df.empty else [None], mode='markers', name='Take Profit', marker=dict(symbol='star', color='orange', size=10)))
-        fig.add_trace(go.Scatter(x=sell_logic_df['Exit_Time'] if not sell_logic_df.empty else [None], y=sell_logic_df['Exit_Price'] if not sell_logic_df.empty else [None], mode='markers', name='Salida (Cruce)', marker=dict(symbol='diamond', color='#9c27b0', size=12, line=dict(width=1, color='white'))))
-        fig.add_trace(go.Scatter(x=sl_df['Exit_Time'] if not sl_df.empty else [None], y=sl_df['Exit_Price'] if not sl_df.empty else [None], mode='markers', name='Stop Loss', marker=dict(symbol='x', color='red', size=10)))
+        tp_df, sl_df = trades_df[trades_df['Type'] == 'TP'], trades_df[trades_df['Type'] == 'SL']
+        fig.add_trace(go.Scatter(x=trades_df['Entry_Time'], y=trades_df['Entry_Price'] * 0.995, mode='markers', name='Entrada (Cruce Arriba)', marker=dict(symbol='triangle-up', color='#00ff00', size=14)))
+        fig.add_trace(go.Scatter(x=tp_df['Exit_Time'] if not tp_df.empty else [None], y=tp_df['Exit_Price'] if not tp_df.empty else [None], mode='markers', name='Take Profit (Retorno a Nube)', marker=dict(symbol='star', color='orange', size=10)))
+        fig.add_trace(go.Scatter(x=sl_df['Exit_Time'] if not sl_df.empty else [None], y=sl_df['Exit_Price'] if not sl_df.empty else [None], mode='markers', name='Stop Loss (Cruce Abajo)', marker=dict(symbol='x', color='red', size=10)))
 
     fig.update_layout(template='plotly_dark', height=500, margin=dict(r=60), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, width='stretch')
