@@ -399,7 +399,7 @@ if not df_raw.empty:
             df_registro['Fecha Salida'] = df_registro['Exit_Time'].dt.strftime('%Y-%m-%d %H:%M')
             df_registro['Precio Entrada'] = df_registro['Entry_Price'].map('{:,.2f}'.format)
             df_registro['Precio Salida'] = df_registro['Exit_Price'].map('{:,.2f}'.format)
-            df_registro['Variación'] = (df_registro['Rendimiento_Pct'] * 100).map('{:+.2f}%'].format)
+            df_registro['Variación'] = (df_registro['Rendimiento_Pct'] * 100).map('{:+.2f}%'.format)
             df_registro['PnL USD'] = df_registro['Resultado_USD'].map('${:+,.2f} USD'.format)
             
             # Cambiamos nombres para presentación formal
