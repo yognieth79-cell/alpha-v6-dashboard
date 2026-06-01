@@ -231,13 +231,19 @@ def calcular_estrategia(df, angulo_requerido, sl_mult):
     df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * 0.5)
     df['En_Zona_Soporte'] = df['Low'] <= df['MediaBuy_Tolerancia']
     df['Memoria_Toque'] = df['En_Zona_Soporte'].rolling(window=5).max() == 1
-    
+    # 1. CONDICIÓN DE ENTRADA: Cruce exacto hacia arriba de la MediaBuy
+    df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
     vela_verde = df['Close'] > df['Open']
-    df['Buy_Trigger'] = df['Memoria_Toque'] & vela_verde & (df['Close'] > df['MediaBuy']) & (df['yhat1'] > df['yhat1'].shift(1)) & (df['Angle'] >= angulo_requerido)
+    
+    # Gatillo: Cruce + Vela Verde + Ángulo Cinético
+    df['Buy_Trigger'] = df['Cruce_MB_Up'] & vela_verde & (df['Angle'] >= angulo_requerido)
     df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
     
     trades = []
-    in_trade, entry_p, sl_price, cruce_latch = False, 0, 0, False 
+    in_trade = False
+    escapo_nube = False # Variable para saber si el precio ya está en la "zona vacía"
+    vela_verde = df['Close'] > df['Open']
+    
     highest_p = 0.0
     
     for i in range(1, len(df)):
