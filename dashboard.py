@@ -175,8 +175,11 @@ def _worker_fetch_data(symbol, interval, dias_visuales):
         intervalo_adaptado = adaptar_intervalo(nombre_motor, interval)
         
         while temp_start < end_time_ms:
-            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={intervalo_adaptado}&limit=1000&startTime={temp_start}"
-            try:
+            # MEXC rechaza 1000 velas si el historial es muy viejo; 500 es el estándar seguro
+            limite = 500 if nombre_motor == "MEXC_OFFSHORE" else 1000
+            
+            url = f"https://{dominio}/api/v3/klines?symbol={symbol}&interval={intervalo_adaptado}&limit={limite}&startTime={temp_start}"
+            
                 response = session.get(url, timeout=10)
                 response.raise_for_status() 
                 data = response.json()
@@ -484,9 +487,9 @@ else:
                 
     st.markdown("<br>", unsafe_allow_html=True)
     
-# Botón de escape para reiniciar el caché y volver a intentar
+    # Botón de escape para reiniciar el caché y volver a intentar
     if st.button("🔄 Forzar Re-conexión de Motores"):
         st.session_state["errores"] = []
-        # CORRECCIÓN: Llamamos a .clear() en el worker cacheado, no en el gestor
+        # La corrección clave: apuntar al worker cacheado, no al gestor
         _worker_fetch_data.clear() 
         st.rerun()
