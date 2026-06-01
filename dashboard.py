@@ -21,7 +21,9 @@ st_autorefresh(interval=60000, key="motor_vigilancia_activa")
 
 def generar_estructura_base_activo():
     return {
-        "tf": "1d", "dias": 90, "grosor_nube": 0.6, # Adaptado al 0.6 de tu imagen
+        "tf": "1d",           # Temporalidad por defecto: 1 Día
+        "dias": 90,           # Historial por defecto: 90 Días (3 Meses)
+        "grosor_nube": 0.60,  # Grosor de Nube por defecto: 0.60 ATR
         "alertas": {"regimen": True, "cruce_mb": True, "cruce_ms": True}
     }
 
@@ -67,7 +69,7 @@ def reproducir_alerta_local(nombre_archivo):
             pass 
 
 # ==========================================
-# 1. UI: BARRA LATERAL (PURA Y LIMPIA)
+# 1. UI: BARRA LATERAL (CONFIGURACIÓN)
 # ==========================================
 st.sidebar.header("🚀 Parámetros Modo Pro")
 
@@ -92,7 +94,6 @@ if symbol_actual not in st.session_state["db_master"]["data_activos"]:
 
 cfg_activo = st.session_state["db_master"]["data_activos"][symbol_actual]
 
-# Migración de seguridad por si el JSON antiguo no tiene 'grosor_nube'
 if "grosor_nube" not in cfg_activo:
     cfg_activo["grosor_nube"] = 0.60
 
@@ -169,7 +170,7 @@ def get_market_data(symbol, interval, dias_visuales):
             break
             
     if not df_list: 
-        registrar_error("BLOQUEO_CATASTROFICO", "Conexión rechazada.")
+        registrar_error("BLOQUEO_CATASTROFICO", "Conexión rejected.")
         st.cache_data.clear()
         return pd.DataFrame()
     
@@ -181,10 +182,9 @@ def get_market_data(symbol, interval, dias_visuales):
     return df
 
 # ==========================================
-# 3. MOTOR CUANTITATIVO: ESTRATEGIA PURIFICADA
+# 3. MOTOR CUANTITATIVO: ESTRATEGIA PURIFICADA NUBE
 # ==========================================
 def calcular_estrategia(df, grosor_nube):
-    # Cálculo base de zonas institucionales
     df['Trailing_Top'] = df['High'].rolling(200).max()
     df['Trailing_Bottom'] = df['Low'].rolling(200).min()
     rango = df['Trailing_Top'] - df['Trailing_Bottom']
@@ -222,15 +222,11 @@ def calcular_estrategia(df, grosor_nube):
     df['Regime_Start'] = df['Regime'] != df['Regime'].shift(1)
     df['Regime_End'] = df['Regime'] != df['Regime'].shift(-1)
     
-    # ----------------------------------------------------
-    # LÓGICA MODO PRO: ENTRADA, TP Y SL PUROS
-    # ----------------------------------------------------
-    
-    # Construcción de la Nube Verde
+    # Construcción Geométrica de la Nube Verde
     df['ATR'] = df['High'].rolling(14).max() - df['Low'].rolling(14).min()
     df['MediaBuy_Tolerancia'] = df['MediaBuy'] + (df['ATR'] * grosor_nube)
     
-    # 1. ENTRADA PURA: Cruce hacia arriba + Vela Verde
+    # ENTRADA PURA: Cruce hacia arriba + Vela Verde
     df['Cruce_MB_Up'] = (df['Close'] > df['MediaBuy']) & (df['Close'].shift(1) <= df['MediaBuy'].shift(1))
     df['Buy_Trigger'] = df['Cruce_MB_Up'] & (df['Close'] > df['Open'])
     df['Signal'] = np.where(df['Buy_Trigger'], 1, -1)
@@ -240,31 +236,24 @@ def calcular_estrategia(df, grosor_nube):
     escapo_nube = False
     
     for i in range(1, len(df)):
-        
-        # Evaluar Apertura de Operación
         if not in_trade and df['Signal'].iloc[i] == 1:
             in_trade = True
             entry_p = df['Close'].iloc[i]
             entry_t = df.index[i]
-            escapo_nube = False # Reseteamos el flag de escape
+            escapo_nube = False
             
         elif in_trade:
-            # Identificar si el precio sale a la Zona Vacía (Por encima de la Nube Verde)
             if df['Low'].iloc[i] > df['MediaBuy_Tolerancia'].iloc[i]:
                 escapo_nube = True
                 
-            # 2. TAKE PROFIT: Si ya escapó, cobrar apenas regrese y toque el techo de la nube
             hit_tp = escapo_nube and (df['Low'].iloc[i] <= df['MediaBuy_Tolerancia'].iloc[i])
-            
-            # 3. STOP LOSS PURO: Cruce hacia abajo de la MediaBuy
             hit_sl = df['Close'].iloc[i] < df['MediaBuy'].iloc[i]
             
-            # LÓGICA DE EJECUCIÓN CON PRIORIDAD GEOMÉTRICA (TP intercepta la caída antes del SL)
+            # Prioridad Geométrica Absoluta
             if hit_tp:
                 exit_p = df['MediaBuy_Tolerancia'].iloc[i] 
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'TP'})
                 in_trade = False
-                
             elif hit_sl:
                 exit_p = df['Close'].iloc[i]
                 trades.append({'Entry_Time': entry_t, 'Entry_Price': entry_p, 'Exit_Time': df.index[i], 'Exit_Price': exit_p, 'Type': 'SL'})
@@ -273,7 +262,7 @@ def calcular_estrategia(df, grosor_nube):
     return df, pd.DataFrame(trades), kmeans
 
 # ==========================================
-# 4. RENDERIZADO VISUAL
+# 4. RENDERIZADO VISUAL Y MÓDULO DE AUDITORÍA
 # ==========================================
 df_raw = get_market_data(symbol_actual, cfg_activo["tf"], cfg_activo["dias"])
 
@@ -308,14 +297,12 @@ if not df_raw.empty:
             for err in st.session_state["errores"]: st.warning(f"[{err['timestamp']}] {err['tipo']} -> {err['detalle']}")
             if st.button("Limpiar Logs"): st.session_state["errores"] = []; st.rerun()
 
+    # Gráfico Principal
     fig = make_subplots(rows=1, cols=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name=ticker_activo, line=dict(color='gray', width=1)))
-    
-    # Renderizado Estricto de Zonas
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy_Tolerancia'], name='Frontera Nube', line=dict(color='rgba(0,230,118,0.2)', width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaBuy'], name='MediaBuy', fill='tonexty', fillcolor='rgba(0,230,118,0.1)', line=dict(color='#00e676', width=2)))
     fig.add_trace(go.Scatter(x=df.index, y=df['MediaSell'], name='MediaSell', line=dict(color='#ff5252', width=2)))
-    
     fig.add_annotation(x=last_time, y=last_price, text=f"<b>{last_price:.2f}</b>", showarrow=True, arrowhead=0, ax=40, ay=0, bgcolor="gray", font=dict(color="white", size=11), xanchor="left")
 
     colores_regimen = ['#00e676', '#2196f3', '#ff9800'] 
@@ -329,13 +316,102 @@ if not df_raw.empty:
     if not trades_df.empty:
         tp_df = trades_df[trades_df['Type'] == 'TP']
         sl_df = trades_df[trades_df['Type'] == 'SL']
-        
         fig.add_trace(go.Scatter(x=trades_df['Entry_Time'], y=trades_df['Entry_Price'] * 0.995, mode='markers', name='Entrada A+', marker=dict(symbol='triangle-up', color='#00ff00', size=14)))
         fig.add_trace(go.Scatter(x=tp_df['Exit_Time'] if not tp_df.empty else [None], y=tp_df['Exit_Price'] if not tp_df.empty else [None], mode='markers', name='Take Profit', marker=dict(symbol='star', color='orange', size=10)))
         fig.add_trace(go.Scatter(x=sl_df['Exit_Time'] if not sl_df.empty else [None], y=sl_df['Exit_Price'] if not sl_df.empty else [None], mode='markers', name='Stop Loss', marker=dict(symbol='x', color='red', size=10)))
 
     fig.update_layout(template='plotly_dark', height=500, margin=dict(r=60), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, width='stretch')
+
+    # =========================================================
+    # NUEVO BLOQUE: SISTEMA DE AUDITORÍA (ESTILO TRADINGVIEW)
+    # =========================================================
+    st.markdown("---")
+    st.subheader("📋 Tester de Estrategia: Informe de Rendimiento")
+    
+    if not trades_df.empty:
+        capital_simulacion = 1000.0  # Monto fijo asignado por trade solicitado
+        
+        # Cálculos matriciales financieros vectorizados
+        trades_df['Rendimiento_Pct'] = (trades_df['Exit_Price'] - trades_df['Entry_Price']) / trades_df['Entry_Price']
+        trades_df['Resultado_USD'] = capital_simulacion * trades_df['Rendimiento_Pct']
+        
+        total_operaciones = len(trades_df)
+        ops_tp = len(trades_df[trades_df['Type'] == 'TP'])
+        ops_sl = len(trades_df[trades_df['Type'] == 'SL'])
+        
+        win_rate = (ops_tp / total_operaciones) * 100 if total_operaciones > 0 else 0.0
+        
+        ganancia_bruta = trades_df[trades_df['Resultado_USD'] > 0]['Resultado_USD'].sum()
+        perdida_bruta = trades_df[trades_df['Resultado_USD'] < 0]['Resultado_USD'].sum()
+        beneficio_neto = trades_df['Resultado_USD'].sum()
+        roi_estrategia = (beneficio_neto / capital_simulacion) * 100
+        
+        profit_factor = ganancia_bruta / abs(perdida_bruta) if perdida_bruta != 0 else np.inf
+        
+        # Renderizado de Tarjetas de Auditoría
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("💰 Beneficio Neto", f"${beneficio_neto:,.2f} USD", delta=f"{roi_estrategia:+.2f}% ROI")
+        c2.metric("🎯 % de Take Profit", f"{win_rate:.2f}%", delta=f"{ops_tp} Ganadas")
+        c3.metric("📊 Operaciones Totales", f"{total_operaciones}", delta=f"{ops_sl} Pérdidas", delta_color="inverse")
+        c4.metric("📈 Ganancia Bruta", f"${ganancia_bruta:,.2f} USD")
+        c5.metric("📉 Pérdida Bruta", f"${perdida_bruta:,.2f} USD")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Estructura de pestañas idéntica a TradingView
+        tab_resumen, tab_registro = st.tabs(["📊 Resumen del Rendimiento", "📜 Lista de Operaciones"])
+        
+        with tab_resumen:
+            datos_tv = {
+                "Métrica de Auditoría": [
+                    "Monto Asignado por Operación",
+                    "Resultado Neto Combinado",
+                    "Retorno sobre Inversión Base (ROI)",
+                    "Factor de Ganancia (Profit Factor)",
+                    "Mayor Operación en Ganancia",
+                    "Mayor Operación en Pérdida",
+                    "Rendimiento Promedio por Trade"
+                ],
+                "Valor Histórico": [
+                    f"${capital_simulacion:,.2f} USD",
+                    f"${beneficio_neto:,.2f} USD",
+                    f"{roi_estrategia:+.2f}%",
+                    f"{profit_factor:.2f}" if profit_factor != np.inf else "Ganancia Pura (Sin Pérdidas)",
+                    f"${trades_df['Resultado_USD'].max():+,.2f} USD",
+                    f"${trades_df['Resultado_USD'].min():+,.2f} USD",
+                    f"${trades_df['Resultado_USD'].mean():+,.2f} USD"
+                ]
+            }
+            st.table(pd.DataFrame(datos_tv))
+            
+            # Conclusión automatizada sobre rentabilidad
+            if beneficio_neto > 0 and win_rate >= 50:
+                st.success(f"✔️ **Evaluación Algorítmica:** La estrategia es **RENTABLE** en este periodo. Muestra una ventaja matemática sólida con un Profit Factor de {profit_factor:.2f}.")
+            elif beneficio_neto > 0:
+                st.warning(f"⚠️ **Evaluación Algorítmica:** La estrategia es **RENTABLE** pero depende de operaciones extraordinarias (Rallies masivos). El Win Rate es bajo ({win_rate:.2f}%).")
+            else:
+                st.error("❌ **Evaluación Algorítmica:** La estrategia **NO ES RENTABLE** bajo las condiciones actuales de mercado en este rango. Requiere optimización de filtros o cambio de activo.")
+                
+        with tab_registro:
+            df_registro = trades_df.copy()
+            df_registro['Fecha Entrada'] = df_registro['Entry_Time'].dt.strftime('%Y-%m-%d %H:%M')
+            df_registro['Fecha Salida'] = df_registro['Exit_Time'].dt.strftime('%Y-%m-%d %H:%M')
+            df_registro['Precio Entrada'] = df_registro['Entry_Price'].map('{:,.2f}'.format)
+            df_registro['Precio Salida'] = df_registro['Exit_Price'].map('{:,.2f}'.format)
+            df_registro['Variación'] = (df_registro['Rendimiento_Pct'] * 100).map('{:+.2f}%'].format)
+            df_registro['PnL USD'] = df_registro['Resultado_USD'].map('${:+,.2f} USD'.format)
+            
+            # Cambiamos nombres para presentación formal
+            df_registro.rename(columns={'Type': 'Tipo Cierre'}, inplace=True)
+            
+            st.dataframe(
+                df_registro[['Fecha Entrada', 'Precio Entrada', 'Fecha Salida', 'Precio Salida', 'Tipo Cierre', 'Variación', 'PnL USD']],
+                use_container_width=True,
+                height=250
+            )
+    else:
+        st.info("ℹ️ No se registran operaciones cerradas en la ventana de tiempo seleccionada para auditar.")
 
 else:
     st.error("🚨 Ejecución detenida por protección algorítmica.")
